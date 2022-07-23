@@ -84,21 +84,24 @@ fn get_vendors(vendor_path: &str) -> anyhow::Result<Vec<Crate>> {
 
 /// Download all crate files and put into spots that are expected by cargo from crates.io
 fn download_and_save(mirror_path: &Path, vendors: Vec<Crate>) -> anyhow::Result<()> {
-    // TODO: check if crate file already exists
     // TODO: async downloading
     for Crate { name, version } in vendors {
-        let url = format!(
-            "https://static.crates.io/crates/{}/{}-{}.crate",
-            name, name, version
-        );
-        println!("Downloading: {}", url);
-        let response = reqwest::blocking::get(url)?;
-
         let dir_crate_path = get_crate_path(mirror_path, &name, &version).unwrap();
-        fs::create_dir_all(&dir_crate_path)?;
-
         let crate_path = dir_crate_path.join(format!("{}-{}.crate", name, version));
-        fs::write(crate_path, response.text()?.as_bytes())?;
+
+        // check if file already exists
+        if fs::metadata(&crate_path).is_err() {
+            // download
+            let url = format!(
+                "https://static.crates.io/crates/{}/{}-{}.crate",
+                name, name, version
+            );
+            println!("Downloading: {}", url);
+            let response = reqwest::blocking::get(url)?;
+
+            fs::create_dir_all(&dir_crate_path)?;
+            fs::write(crate_path, response.text()?.as_bytes())?;
+        }
     }
 
     Ok(())
