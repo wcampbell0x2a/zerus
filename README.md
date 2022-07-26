@@ -1,7 +1,6 @@
 # zerus
 
-Lightweight binary to download only project required crates for offline environments
-
+Lightweight binary to download only project required crates for offline crates.io mirror
 
 ## Requirements
 Currently, this relies on nightly [sparse-registry](https://blog.rust-lang.org/2022/06/22/sparse-registry-testing.html)
