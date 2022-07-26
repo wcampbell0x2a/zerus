@@ -30,14 +30,14 @@ $ python -m http.server 80
 ```
 
 ## Build
-For building the project that you ran `cargo vendor` for, add the following to a `.cargo/config` file.
+For building the project that you ran `cargo vendor` for, add the following to a `.cargo/config` file(repacing IP with your ip).
 ```
 [unstable]
 sparse-registry = true
 
 [source.zerus]
-registry = "sparse+http://[ip]/crates.io-index/"
+registry = "sparse+http://[IP]/crates.io-index/"
 
-[source.zerus]
+[source.crates-io]
 replace-with = "zerus"
 ```
