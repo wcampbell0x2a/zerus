@@ -97,6 +97,7 @@ fn download_and_save(mirror_path: &Path, vendors: Vec<Crate>) -> anyhow::Result<
                 name, name, version
             );
             println!("Downloading: {}", url);
+            // TODO: save one client and call get()
             let response = reqwest::blocking::get(url)?;
 
             fs::create_dir_all(&dir_crate_path)?;
