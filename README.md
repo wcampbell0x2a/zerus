@@ -11,6 +11,14 @@ Lightweight binary to download only project required crates for offline crates.i
 ## Requirements
 Currently, this relies on nightly [sparse-registry](https://blog.rust-lang.org/2022/06/22/sparse-registry-testing.html)
 
+## Build zerus
+Either build from published source in crates.io.
+```
+$ cargo install zerus
+```
+
+Or download from [github releases](https://github.com/wcampbell0x2a/zerus/releases).
+
 ## Setup
 Create vendor folder with all project dependencies:
 ```
@@ -19,7 +27,7 @@ $ cargo vendor
 
 Run the following command to run this project, pointing to the `vendor` directory made in the previous step:
 ```
-$ cargo r --release --bin zerus -- vendor offline-mirror
+$ zerus vendor offline-mirror
 ```
 
 Now clone the `crates.io-index`:
