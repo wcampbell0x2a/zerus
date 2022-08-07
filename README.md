@@ -22,12 +22,11 @@ $ cd offline-mirror
 $ git clone https://github.com/rust-lang/crates.io-index
 ```
 
-## Serve: `sparse-registry` nightly cargo
-
+## Serve mirror
 Use [miniserve](https://github.com/svenstaro/miniserve).
 
-### Build
-For building the project that you ran `cargo vendor` for, add the following to a `.cargo/config` file(repacing IP with your ip).
+### Build with mirror
+For building the project that you ran `cargo vendor`, add the following to a `.cargo/config` file(replacing IP with your ip).
 ```
 [unstable]
 sparse-registry = true
