@@ -6,5 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 08-07-2022
+- Deprecate `serve`, we only support the nightly feature `sparse-registry`
+
 ## [0.1.0] - 07-27-2022
 - Initial Release
