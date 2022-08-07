@@ -24,6 +24,8 @@ $ git clone https://github.com/rust-lang/crates.io-index
 
 ## Serve: `sparse-registry` nightly cargo
 
+Use [miniserve](https://github.com/svenstaro/miniserve).
+
 ### Build
 For building the project that you ran `cargo vendor` for, add the following to a `.cargo/config` file(repacing IP with your ip).
 ```
