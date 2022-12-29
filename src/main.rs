@@ -87,16 +87,13 @@ fn download_and_save(mirror_path: &Path, vendors: Vec<Crate>) -> anyhow::Result<
     // TODO: async downloading
     for Crate { name, version } in vendors {
         let dir_crate_path = get_crate_path(mirror_path, &name, &version).unwrap();
-        let crate_path = dir_crate_path.join(format!("{}-{}.crate", name, version));
+        let crate_path = dir_crate_path.join(format!("{name}-{version}.crate"));
 
         // check if file already exists
         if fs::metadata(&crate_path).is_err() {
             // download
-            let url = format!(
-                "https://static.crates.io/crates/{}/{}-{}.crate",
-                name, name, version
-            );
-            println!("Downloading: {}", url);
+            let url = format!("https://static.crates.io/crates/{name}/{name}-{version}.crate");
+            println!("Downloading: {url}");
             // TODO: save one client and call get()
             let response = reqwest::blocking::get(url)?;
 
