@@ -6,6 +6,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 12-30-2022
+- Deprecate need for `cargo vendor`, instead resolving depends from Cargo.toml files ourself using `guppy`.
+
 ## [0.2.0] - 08-07-2022
 - Deprecate `serve`, we only support the nightly feature `sparse-registry`
 
