@@ -10,12 +10,10 @@ homepage = "https://github.com/wcampbell0x2a/zerus"
 repository = "https://github.com/wcampbell0x2a/zerus"
 
 [dependencies]
-walkdir = "2.3.2"
-clap = { version = "3.2.14", features = ["derive"] }
-toml = "0.5.9"
+clap = { version = "4.0.0", features = ["derive"] }
 reqwest = { version = "0.11.11", default-features = false, features = ["blocking", "rustls-tls"] }
 anyhow = "1.0.58"
+guppy = "0.15.1"
 
 [profile.release]
-lto = true
 strip = true
