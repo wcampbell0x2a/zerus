@@ -19,22 +19,25 @@ $ cargo install zerus
 
 Or download from [github releases](https://github.com/wcampbell0x2a/zerus/releases).
 
-## Setup
-Create vendor folder with all project dependencies:
-```
-$ cargo vendor
+## Usage
+```console
+Usage: zerus <MIRROR_PATH> [WORKSPACE]...
+
+Arguments:
+  <MIRROR_PATH>   new directory to contain offline mirror crate files
+  [WORKSPACE]...  list of Cargo.toml files to vendor depends
+
+Options:
+  -h, --help  Print help information
 ```
 
-Run the following command to run this project, pointing to the `vendor` directory made in the previous step:
-```
-$ zerus vendor offline-mirror
-```
-
-Now clone the `crates.io-index`:
-```
-$ cd offline-mirror
+Example:
+```console
+$ zerus new-mirror ../deku/Cargo.toml ../adsb_deku/Cargo.toml
+$ cd new-mirror
 $ git clone https://github.com/rust-lang/crates.io-index
 ```
+
 
 ## Serve mirror
 Use [miniserve](https://github.com/svenstaro/miniserve).
