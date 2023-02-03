@@ -14,7 +14,7 @@ Currently, this relies on nightly [sparse-registry](https://blog.rust-lang.org/2
 ## Build zerus
 Either build from published source in crates.io.
 ```
-$ cargo install zerus
+$ cargo install zerus --locked
 ```
 
 Or download from [github releases](https://github.com/wcampbell0x2a/zerus/releases).
