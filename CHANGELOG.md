@@ -6,6 +6,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 02-02-2023
+- Update example usage of `spare-registry` in readme to latest stabilized config
+- Fix path of crates of filename length 3
+- Add example `config.json` to README
+
 ## [0.3.0] - 12-30-2022
 - Deprecate need for `cargo vendor`, instead resolving depends from Cargo.toml files ourself using `guppy`.
 

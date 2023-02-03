@@ -36,6 +36,12 @@ Example:
 $ zerus new-mirror ../deku/Cargo.toml ../adsb_deku/Cargo.toml
 $ cd new-mirror
 $ git clone https://github.com/rust-lang/crates.io-index
+# configure crates.io-index to point to our host
+$ cat crates.io-index/config.json
+{
+  "dl": "http://[IP]/crates/{prefix}/{crate}/{version}/{crate}-{version}.crate",
+  "api": "http://[IP]/crates"
+}
 ```
 
 
@@ -43,10 +49,10 @@ $ git clone https://github.com/rust-lang/crates.io-index
 Use [miniserve](https://github.com/svenstaro/miniserve).
 
 ### Build with mirror
-For building the project that you ran `cargo vendor`, add the following to a `.cargo/config` file(replacing IP with your ip).
+Add the following to the `.cargo/config` file(replacing IP with your ip).
 ```
-[unstable]
-sparse-registry = true
+[registries.crates-io]
+protocol = "sparse"
 
 [source.zerus]
 registry = "sparse+http://[IP]/crates.io-index/"
