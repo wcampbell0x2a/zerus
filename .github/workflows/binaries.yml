@@ -45,4 +45,5 @@ jobs:
           file: ${{ matrix.bins }}-${{ matrix.targets }}.tar.gz
           asset_name: ${{ matrix.bins }}-${{ matrix.targets }}.tar.gz
           tag: ${{ github.ref }}
+          prerelease: true
           overwrite: true
