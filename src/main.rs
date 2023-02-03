@@ -100,10 +100,10 @@ fn download_and_save(mirror_path: &Path, vendors: Vec<Crate>) -> anyhow::Result<
             let url = format!("https://static.crates.io/crates/{name}/{name}-{version}.crate");
             println!("[-] Downloading: {url}");
             // TODO: save one client and call get()
-            let response = reqwest::blocking::get(url)?;
+            let response = reqwest::blocking::get(url)?.bytes()?;
 
             fs::create_dir_all(&dir_crate_path)?;
-            fs::write(crate_path, response.text()?.as_bytes())?;
+            fs::write(crate_path, response)?;
         }
     }
 
