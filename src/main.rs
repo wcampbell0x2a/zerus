@@ -61,6 +61,15 @@ fn get_deps(args: &Args) -> Vec<Crate> {
     crates
 }
 
+/// See https://doc.rust-lang.org/cargo/reference/registries.html#index-format
+///
+/// This follows the following config.json:
+/// ```json
+/// {
+///   "dl": "http://[IP]/crates/{prefix}/{crate}/{version}/{crate}-{version}.crate",
+///   "api": "http://[IP]/crates"
+/// }
+/// ```
 pub fn get_crate_path(
     mirror_path: &Path,
     crate_name: &str,
@@ -69,7 +78,10 @@ pub fn get_crate_path(
     let crate_path = match crate_name.len() {
         1 => PathBuf::from("1"),
         2 => PathBuf::from("2"),
-        3 => PathBuf::from("3"),
+        3 => {
+            let first = crate_name.get(0..1)?;
+            [PathBuf::from("3"), first.into()].iter().collect()
+        }
         n if n >= 4 => {
             let first_two = crate_name.get(0..2)?;
             let second_two = crate_name.get(2..4)?;
