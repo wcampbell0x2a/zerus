@@ -13,7 +13,7 @@ repository = "https://github.com/wcampbell0x2a/zerus"
 clap = { version = "4.4.7", features = ["derive"] }
 reqwest = { version = "0.11.22", default-features = false, features = ["blocking", "rustls-tls"] }
 anyhow = "1.0.58"
-guppy = "0.17.1"
+guppy = "0.17.2"
 
 [profile.release]
 strip = true
