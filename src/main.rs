@@ -1,3 +1,7 @@
+mod build_std;
+use build_std::prepare_build_std;
+use reqwest::blocking::Client;
+
 use std::path::{Path, PathBuf};
 use std::{fs, iter};
 
@@ -20,8 +24,13 @@ impl Crate {
 struct Args {
     /// new directory to contain offline mirror crate files
     mirror_path: PathBuf,
+
     /// list of Cargo.toml files to vendor depends
-    workspace: Vec<String>,
+    workspaces: Vec<String>,
+
+    /// Cache build-std depends for nightly version
+    #[clap(long, value_name = "VERSION")]
+    build_std: Option<String>,
 }
 
 fn main() {
@@ -30,15 +39,26 @@ fn main() {
     std::fs::create_dir_all(&args.mirror_path).unwrap();
     println!("[-] Created {}", args.mirror_path.display());
 
-    let crates = get_deps(&args);
+    let Some(crates) = get_deps(&args) else {
+        return;
+    };
 
     download_and_save(&args.mirror_path, crates).expect("unable to download crates");
     println!("[-] Finished Downloading");
 }
 
-fn get_deps(args: &Args) -> Vec<Crate> {
-    let mut crates = vec![];
-    for workspace in &args.workspace {
+/// # Returns
+/// `Vec<Workspace, Vec<Crate>>`
+fn get_deps(args: &Args) -> Option<Vec<(String, Vec<Crate>)>> {
+    let mut workspaces = args.workspaces.clone();
+    if let Some(version) = &args.build_std {
+        let build_std = prepare_build_std(version)?;
+        workspaces.push(build_std);
+    }
+
+    let mut ret = vec![];
+    for workspace in workspaces {
+        let mut crates = vec![];
         let package_graph = MetadataCommand::new()
             .manifest_path(workspace.clone())
             .build_graph()
@@ -56,9 +76,10 @@ fn get_deps(args: &Args) -> Vec<Crate> {
                 ));
             }
         }
+        ret.push((workspace.clone(), crates));
     }
 
-    crates
+    Some(ret)
 }
 
 /// See https://doc.rust-lang.org/cargo/reference/registries.html#index-format
@@ -100,22 +121,25 @@ pub fn get_crate_path(
 }
 
 /// Download all crate files and put into spots that are expected by cargo from crates.io
-fn download_and_save(mirror_path: &Path, vendors: Vec<Crate>) -> anyhow::Result<()> {
+fn download_and_save(mirror_path: &Path, vendors: Vec<(String, Vec<Crate>)>) -> anyhow::Result<()> {
     // TODO: async downloading
-    for Crate { name, version } in vendors {
-        let dir_crate_path = get_crate_path(mirror_path, &name, &version).unwrap();
-        let crate_path = dir_crate_path.join(format!("{name}-{version}.crate"));
+    let client = Client::new();
+    for (workspace, crates) in vendors {
+        println!("[-] Vendoring: {workspace}");
+        for Crate { name, version } in crates {
+            let dir_crate_path = get_crate_path(mirror_path, &name, &version).unwrap();
+            let crate_path = dir_crate_path.join(format!("{name}-{version}.crate"));
 
-        // check if file already exists
-        if fs::metadata(&crate_path).is_err() {
-            // download
-            let url = format!("https://static.crates.io/crates/{name}/{name}-{version}.crate");
-            println!("[-] Downloading: {url}");
-            // TODO: save one client and call get()
-            let response = reqwest::blocking::get(url)?.bytes()?;
+            // check if file already exists
+            if fs::metadata(&crate_path).is_err() {
+                // download
+                let url = format!("https://static.crates.io/crates/{name}/{name}-{version}.crate");
+                println!("[-] Downloading: {url}");
+                let response = client.get(url).send()?.bytes()?;
 
-            fs::create_dir_all(&dir_crate_path)?;
-            fs::write(crate_path, response)?;
+                fs::create_dir_all(&dir_crate_path)?;
+                fs::write(crate_path, response)?;
+            }
         }
     }
 
