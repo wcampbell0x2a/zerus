@@ -9,7 +9,7 @@ zerus
 Lightweight binary to download only project required crates for offline crates.io mirror
 
 ## Requirements
-The example use case is with nightly feature [sparse-registry](https://blog.rust-lang.org/inside-rust/2023/01/30/cargo-sparse-protocol.html).
+The example use case is with feature [sparse-registry](https://blog.rust-lang.org/inside-rust/2023/01/30/cargo-sparse-protocol.html).
 However, a crates.io-index mirror git repo can be hosted on its on and point towards this repo with stable rust.
 
 ## Build zerus
@@ -22,14 +22,15 @@ Or download from [github releases](https://github.com/wcampbell0x2a/zerus/releas
 
 ## Usage
 ```console
-Usage: zerus <MIRROR_PATH> [WORKSPACE]...
+Usage: zerus [OPTIONS] <MIRROR_PATH> [WORKSPACES]...
 
 Arguments:
-  <MIRROR_PATH>   new directory to contain offline mirror crate files
-  [WORKSPACE]...  list of Cargo.toml files to vendor depends
+  <MIRROR_PATH>    new directory to contain offline mirror crate files
+  [WORKSPACES]...  list of Cargo.toml files to vendor depends
 
 Options:
-  -h, --help  Print help information
+      --build-std <VERSION>  Cache build-std depends for nightly version
+  -h, --help                 Print help
 ```
 
 Example:
@@ -52,9 +53,6 @@ Use [miniserve](https://github.com/svenstaro/miniserve).
 ### Build with mirror
 Add the following to the `.cargo/config` file(replacing IP with your ip).
 ```
-[registries.crates-io]
-protocol = "sparse"
-
 [source.zerus]
 registry = "sparse+http://[IP]/crates.io-index/"
 
