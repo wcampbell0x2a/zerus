@@ -6,6 +6,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 02-03-2024
+- Support vendoring rustc build-std dependencies for specific nightly versions with `zerus --build-std`
+- Improve performance
+- Update README.md
+
 ## [0.4.0] - 02-02-2023
 - Update example usage of `spare-registry` in readme to latest stabilized config
 - Fix path of crates of filename length 3
