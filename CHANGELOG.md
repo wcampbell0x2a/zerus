@@ -6,6 +6,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 02-25-2024
+- Download crates in parallel
+
 ## [0.5.0] - 02-03-2024
 - Support vendoring rustc build-std dependencies for specific nightly versions with `zerus --build-std`
 - Improve performance
