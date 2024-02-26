@@ -1,6 +1,5 @@
 mod build_std;
 use build_std::prepare_build_std;
-use reqwest::blocking::Client;
 
 use std::path::{Path, PathBuf};
 use std::{fs, iter};
@@ -8,6 +7,8 @@ use std::{fs, iter};
 use clap::Parser;
 use guppy::graph::DependencyDirection;
 use guppy::MetadataCommand;
+use rayon::prelude::*;
+use reqwest::blocking::Client;
 
 struct Crate {
     name: String,
@@ -122,26 +123,31 @@ pub fn get_crate_path(
 
 /// Download all crate files and put into spots that are expected by cargo from crates.io
 fn download_and_save(mirror_path: &Path, vendors: Vec<(String, Vec<Crate>)>) -> anyhow::Result<()> {
-    // TODO: async downloading
-    let client = Client::new();
-    for (workspace, crates) in vendors {
+    vendors.into_par_iter().for_each(|(workspace, crates)| {
         println!("[-] Vendoring: {workspace}");
+        let client = Client::new();
         for Crate { name, version } in crates {
             let dir_crate_path = get_crate_path(mirror_path, &name, &version).unwrap();
             let crate_path = dir_crate_path.join(format!("{name}-{version}.crate"));
 
             // check if file already exists
-            if fs::metadata(&crate_path).is_err() {
+            while fs::metadata(crate_path.clone()).is_err() {
                 // download
                 let url = format!("https://static.crates.io/crates/{name}/{name}-{version}.crate");
                 println!("[-] Downloading: {url}");
-                let response = client.get(url).send()?.bytes()?;
+                let Ok(response) = client.get(url).send() else {
+                    break;
+                };
 
-                fs::create_dir_all(&dir_crate_path)?;
-                fs::write(crate_path, response)?;
+                let Ok(response) = response.bytes() else {
+                    break;
+                };
+
+                fs::create_dir_all(&dir_crate_path).unwrap();
+                fs::write(crate_path.clone(), response).unwrap();
             }
         }
-    }
+    });
 
     Ok(())
 }
