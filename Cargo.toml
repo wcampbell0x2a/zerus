@@ -12,7 +12,7 @@ categories = ["development-tools"]
 
 [dependencies]
 clap = { version = "4.5.2", features = ["derive"] }
-reqwest = { version = "0.12.0", default-features = false, features = ["blocking", "rustls-tls", "http2"] }
+reqwest = { version = "0.12.2", default-features = false, features = ["blocking", "rustls-tls", "http2"] }
 anyhow = "1.0.81"
 guppy = "0.17.5"
 rayon = "1.9.0"
