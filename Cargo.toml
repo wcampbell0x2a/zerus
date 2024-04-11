@@ -11,7 +11,7 @@ repository = "https://github.com/wcampbell0x2a/zerus"
 categories = ["development-tools"]
 
 [dependencies]
-clap = { version = "4.5.2", features = ["derive"] }
+clap = { version = "4.5.4", features = ["derive"] }
 reqwest = { version = "0.12.0", default-features = false, features = ["blocking", "rustls-tls", "http2"] }
 anyhow = "1.0.82"
 guppy = "0.17.5"
