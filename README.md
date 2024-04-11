@@ -8,10 +8,6 @@ zerus
 
 Lightweight binary to download only project required crates for offline crates.io mirror
 
-## Requirements
-The example use case is with feature [sparse-registry](https://blog.rust-lang.org/inside-rust/2023/01/30/cargo-sparse-protocol.html).
-However, a crates.io-index mirror git repo can be hosted on its on and point towards this repo with stable rust.
-
 ## Build zerus
 Either build from published source in crates.io.
 ```
@@ -36,8 +32,6 @@ Options:
 Example:
 ```console
 $ zerus new-mirror ../deku/Cargo.toml ../adsb_deku/Cargo.toml
-$ cd new-mirror
-$ git clone https://github.com/rust-lang/crates.io-index
 # configure crates.io-index to point to our host
 $ cat crates.io-index/config.json
 {
