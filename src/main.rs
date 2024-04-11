@@ -10,6 +10,10 @@ use guppy::MetadataCommand;
 use rayon::prelude::*;
 use reqwest::blocking::Client;
 
+use crate::git::{clone, fetch};
+
+mod git;
+
 struct Crate {
     name: String,
     version: String,
@@ -45,7 +49,16 @@ fn main() {
     };
 
     download_and_save(&args.mirror_path, crates).expect("unable to download crates");
-    println!("[-] Finished Downloading");
+    println!("[-] Finished downloading crates");
+
+    println!("[-] Syncing git index crates.io");
+    let repo = args.mirror_path.join("crates.io-index");
+    if repo.exists() {
+        fetch(Path::new(&repo)).unwrap();
+    } else {
+        clone(Path::new(&repo)).unwrap();
+    }
+    println!("[-] Done syncing git index crates.io");
 }
 
 /// # Returns
