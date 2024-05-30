@@ -6,6 +6,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 05-30-2024
+- Force checkout when using Fast-Forward when updating git `crates.io-index`
+
 ## [0.8.0] - 05-29-2024
 - Properly set local HEAD to fetched git repo `crates.io-index` when updating from previous zerus invocation
 

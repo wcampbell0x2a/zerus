@@ -232,6 +232,6 @@ fn fast_forward(
     println!("{}", msg);
     lb.set_target(rc.id(), &msg)?;
     repo.set_head(&name)?;
-    repo.checkout_head(None)?;
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))?;
     Ok(())
 }
