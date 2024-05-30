@@ -10,7 +10,7 @@ use guppy::MetadataCommand;
 use rayon::prelude::*;
 use reqwest::blocking::Client;
 
-use crate::git::{clone, fetch};
+use crate::git::{clone, pull};
 
 mod git;
 
@@ -54,7 +54,7 @@ fn main() {
     println!("[-] Syncing git index crates.io");
     let repo = args.mirror_path.join("crates.io-index");
     if repo.exists() {
-        fetch(Path::new(&repo)).unwrap();
+        pull(Path::new(&repo)).unwrap();
     } else {
         clone(Path::new(&repo)).unwrap();
     }

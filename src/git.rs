@@ -98,7 +98,7 @@ pub fn clone(repo_path: &Path) -> Result<(), git2::Error> {
     Ok(())
 }
 
-pub fn fetch(repo: &Path) -> Result<(), git2::Error> {
+pub fn pull(repo: &Path) -> Result<(), git2::Error> {
     let repo = Repository::open(repo)?;
     let remote = "origin";
 
@@ -188,5 +188,50 @@ pub fn fetch(repo: &Path) -> Result<(), git2::Error> {
     // needed objects are available locally.
     remote.update_tips(None, true, AutotagOption::Unspecified, None)?;
 
+    let fetch_head = repo.find_reference("FETCH_HEAD")?;
+    let fetch_commit = repo.reference_to_annotated_commit(&fetch_head)?;
+
+    let refname = "refs/heads/master";
+    match repo.find_reference(refname) {
+        Ok(mut r) => {
+            fast_forward(&repo, &mut r, &fetch_commit)?;
+        }
+        Err(_) => {
+            // The branch doesn't exist so just set the reference to the
+            // commit directly. Usually this is because you are pulling
+            // into an empty repository.
+            repo.reference(
+                refname,
+                fetch_commit.id(),
+                true,
+                &format!("Setting master to {}", fetch_commit.id()),
+            )?;
+            repo.set_head(refname)?;
+            repo.checkout_head(Some(
+                git2::build::CheckoutBuilder::default()
+                    .allow_conflicts(true)
+                    .conflict_style_merge(true)
+                    .force(),
+            ))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn fast_forward(
+    repo: &Repository,
+    lb: &mut git2::Reference,
+    rc: &git2::AnnotatedCommit,
+) -> Result<(), git2::Error> {
+    let name = match lb.name() {
+        Some(s) => s.to_string(),
+        None => String::from_utf8_lossy(lb.name_bytes()).to_string(),
+    };
+    let msg = format!("Fast-Forward: Setting {} to id: {}", name, rc.id());
+    println!("{}", msg);
+    lb.set_target(rc.id(), &msg)?;
+    repo.set_head(&name)?;
+    repo.checkout_head(None)?;
     Ok(())
 }
