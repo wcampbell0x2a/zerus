@@ -1,6 +1,7 @@
 mod build_std;
 use build_std::prepare_build_std;
 
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::{fs, iter};
 
@@ -11,6 +12,7 @@ use rayon::prelude::*;
 use reqwest::blocking::Client;
 
 use crate::git::{clone, pull};
+use zerus::{Depend, TopLevelDepends};
 
 mod git;
 
@@ -44,9 +46,12 @@ fn main() {
     std::fs::create_dir_all(&args.mirror_path).unwrap();
     println!("[-] Created {}", args.mirror_path.display());
 
-    let Some(crates) = get_deps(&args) else {
+    let Some((crates, top_level)) = get_deps(&args) else {
         return;
     };
+
+    let file = File::create(format!("{}/depends.json", args.mirror_path.display())).unwrap();
+    serde_json::to_writer(file, &top_level).unwrap();
 
     download_and_save(&args.mirror_path, crates).expect("unable to download crates");
     println!("[-] Finished downloading crates");
@@ -63,7 +68,8 @@ fn main() {
 
 /// # Returns
 /// `Vec<Workspace, Vec<Crate>>`
-fn get_deps(args: &Args) -> Option<Vec<(String, Vec<Crate>)>> {
+fn get_deps(args: &Args) -> Option<(Vec<(String, Vec<Crate>)>, TopLevelDepends)> {
+    let mut top_level = TopLevelDepends { depends: vec![] };
     let mut workspaces = args.workspaces.clone();
     if let Some(version) = &args.build_std {
         let build_std = prepare_build_std(version)?;
@@ -73,6 +79,24 @@ fn get_deps(args: &Args) -> Option<Vec<(String, Vec<Crate>)>> {
     let mut ret = vec![];
     for workspace in workspaces {
         let mut crates = vec![];
+
+        // Build from cargo metadata --no-deps to save the top-level
+        // depends
+        let metadata = cargo_metadata::MetadataCommand::new()
+            .manifest_path(workspace.clone())
+            .no_deps()
+            .exec()
+            .unwrap();
+        for package in metadata.packages {
+            for d in package.dependencies {
+                top_level.depends.push(Depend {
+                    name: d.name,
+                    version: d.req.to_string(),
+                });
+            }
+        }
+
+        // build depend graph and download all depends of top-level
         let package_graph = MetadataCommand::new()
             .manifest_path(workspace.clone())
             .build_graph()
@@ -80,6 +104,7 @@ fn get_deps(args: &Args) -> Option<Vec<(String, Vec<Crate>)>> {
 
         let packages = package_graph.packages();
         for package in packages {
+            dbg!(package);
             let id = package.id();
             let query = package_graph.query_forward(iter::once(id)).unwrap();
             let package_set = query.resolve();
@@ -93,7 +118,7 @@ fn get_deps(args: &Args) -> Option<Vec<(String, Vec<Crate>)>> {
         ret.push((workspace.clone(), crates));
     }
 
-    Some(ret)
+    Some((ret, top_level))
 }
 
 /// See https://doc.rust-lang.org/cargo/reference/registries.html#index-format

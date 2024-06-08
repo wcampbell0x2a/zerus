@@ -1,0 +1,14 @@
+<html>
+  <head>
+  </head>
+  <body>
+    <h1>Available Crates</h1>
+    <ul>
+    {% for c in crates %}
+    <li>
+      <b>{{ c.name }}</b>: {{ c.version }}
+    </li>
+    {% endfor %}
+    </ul>
+  </body>
+</html>
