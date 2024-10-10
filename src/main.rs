@@ -1,5 +1,6 @@
 mod build_std;
 use build_std::prepare_build_std;
+use guppy::errors::Error::CommandError;
 
 use std::path::{Path, PathBuf};
 use std::{fs, iter};

@@ -1,19 +1,26 @@
+use std::{
+    fs::{File, OpenOptions},
+    io::Write,
+};
+
 use assert_cmd::Command;
-use tempfile::tempdir;
+use tempfile::Builder;
 
 #[test]
 fn test_old_nightly_version() {
+    let nightly_ver = "nightly-2024-05-19";
     let path = assert_cmd::cargo::cargo_bin("zerus");
     let mut cmd = Command::new(path);
 
-    let tmp_dir = tempdir().unwrap();
+    let tmp_dir = Builder::new().tempdir_in("./").unwrap();
+    let tmp_dir_path = tmp_dir.into_path();
     let output = cmd
         .env("RUST_LOG", "none")
         .args([
-            tmp_dir.path().to_str().unwrap(),
+            tmp_dir_path.to_str().unwrap(),
             "--skip-git-index",
             "--build-std",
-            "nightly-2024-05-19",
+            nightly_ver,
         ])
         .output()
         .unwrap();
@@ -28,7 +35,7 @@ fn test_old_nightly_version() {
         std::str::from_utf8(&output.stdout).unwrap(),
         format!(
             r#"[-] Created {}
-[-] Vendoring: {rustup_home}/toolchains/nightly-2024-05-19-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/test/Cargo.toml
+[-] Vendoring: {rustup_home}/toolchains/{nightly_ver}-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/test/Cargo.toml
 [-] Downloading: https://static.crates.io/crates/alloc/alloc-0.0.0.crate
 [-] Downloading: https://static.crates.io/crates/allocator-api2/allocator-api2-0.2.18.crate
 [-] Downloading: https://static.crates.io/crates/cfg-if/cfg-if-1.0.0.crate
@@ -50,26 +57,28 @@ fn test_old_nightly_version() {
 [-] Downloading: https://static.crates.io/crates/unwind/unwind-0.0.0.crate
 [-] Finished downloading crates
 "#,
-            tmp_dir.path().to_str().unwrap()
+            tmp_dir_path.to_str().unwrap()
         )
     );
 
-    // TODO: test -Zbuild-std with vendor
+    test_build_std(nightly_ver, tmp_dir_path.to_path_buf(), 8081);
 }
 
 #[test]
 fn test_new_nightly_version() {
+    let nightly_ver = "nightly-2024-10-09";
     let path = assert_cmd::cargo::cargo_bin("zerus");
     let mut cmd = Command::new(path);
 
-    let tmp_dir = tempdir().unwrap();
+    let tmp_dir = Builder::new().tempdir_in("./").unwrap();
+    let tmp_dir_path = tmp_dir.into_path();
     let output = cmd
         .env("RUST_LOG", "none")
         .args([
-            tmp_dir.path().to_str().unwrap(),
+            tmp_dir_path.to_str().unwrap(),
             "--skip-git-index",
             "--build-std",
-            "nightly-2024-10-09",
+            nightly_ver,
         ])
         .output()
         .unwrap();
@@ -84,7 +93,7 @@ fn test_new_nightly_version() {
         std::str::from_utf8(&output.stdout).unwrap(),
         format!(
             r#"[-] Created {}
-[-] Vendoring: {rustup_home}/toolchains/nightly-2024-10-09-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/test/Cargo.toml
+[-] Vendoring: {rustup_home}/toolchains/{nightly_ver}-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/test/Cargo.toml
 [-] Downloading: https://static.crates.io/crates/addr2line/addr2line-0.22.0.crate
 [-] Downloading: https://static.crates.io/crates/adler/adler-1.0.2.crate
 [-] Downloading: https://static.crates.io/crates/alloc/alloc-0.0.0.crate
@@ -120,9 +129,115 @@ fn test_new_nightly_version() {
 [-] Downloading: https://static.crates.io/crates/unwind/unwind-0.0.0.crate
 [-] Finished downloading crates
 "#,
-            tmp_dir.path().to_str().unwrap()
+            tmp_dir_path.to_str().unwrap()
         )
     );
 
-    // TODO: test -Zbuild-std with vendor
+    test_build_std(nightly_ver, tmp_dir_path.to_path_buf(), 8080);
+}
+
+fn test_build_std(nightly_ver: &str, tmp_dir_path: std::path::PathBuf, port: u32) {
+    // run zerus again, but this time add the entire git index
+    let path = assert_cmd::cargo::cargo_bin("zerus");
+    let mut cmd = Command::new(path);
+    let output = cmd
+        .env("RUST_LOG", "none")
+        .args([
+            tmp_dir_path.to_str().unwrap(),
+            // "--skip-git-index",
+            "--build-std",
+            nightly_ver,
+        ])
+        .output()
+        .unwrap();
+
+    // modify the config.json
+    let mut file = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(tmp_dir_path.join("crates.io-index/config.json"))
+        .unwrap();
+    file.write_all(
+        &format!(
+            r#"{{
+  "dl": "http://127.0.0.1:{port}/crates/{{prefix}}/{{crate}}/{{version}}/{{crate}}-{{version}}.crate",
+  "api": "http://127.0.0.1:{port}/crates"
+}}"#
+        )
+        .into_bytes(),
+    )
+    .unwrap();
+
+    // Create a temp directory for a cargo project
+    let tmp_dir_cargo = Builder::new().tempdir_in("./").unwrap();
+    let tmp_dir_cargo_path = tmp_dir_cargo.into_path();
+
+    // host the crates with a dummy python3 http server
+    let mut server_handle = std::process::Command::new("python3")
+        .args([
+            "-m",
+            "http.server",
+            "-d",
+            tmp_dir_path.to_str().unwrap(),
+            &port.to_string(),
+        ])
+        .spawn()
+        .expect("python3 server command failed to start");
+
+    // create the cargo project
+    std::process::Command::new("cargo")
+        .args(["new", "testing"])
+        .current_dir(&tmp_dir_cargo_path)
+        .output()
+        .unwrap();
+    std::process::Command::new("mkdir")
+        .args(["-p", ".cargo"])
+        .current_dir(&tmp_dir_cargo_path.join("testing/"))
+        .output()
+        .unwrap();
+    // write a config file
+    // 1. static binary
+    // 2. build-std
+    // 3. use our crates
+    let mut file = File::create(&tmp_dir_cargo_path.join("testing/.cargo/config.toml")).unwrap();
+    file.write_all(
+        &format!(
+            r#"
+[source.zerus]
+registry = "sparse+http://127.0.0.1:{port}/crates.io-index/"
+
+[source.crates-io]
+replace-with = "zerus"
+
+[build]
+rustflags = [
+    "-C", "panic=abort",
+    "-C", "target-feature=+crt-static",
+]
+
+
+[unstable]
+build-std = ["std", "panic_abort"]
+build-std-features = ["panic_immediate_abort"]
+"#,
+        )
+        .into_bytes(),
+    )
+    .unwrap();
+
+    // Run cross to create a *-musl binary that will build -Zbuild-std
+    // for a specific nightly version
+    let output = std::process::Command::new("cross")
+        .args([
+            &format!("+{nightly_ver}"),
+            "build",
+            "--target",
+            "x86_64-unknown-linux-musl",
+        ])
+        // Allow access to local python server
+        .env("CROSS_CONTAINER_OPTS", "--network=host")
+        .current_dir(&tmp_dir_cargo_path.join("testing/"))
+        .output()
+        .unwrap();
+    assert!(output.status.success());
 }
