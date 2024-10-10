@@ -18,5 +18,9 @@ guppy = "0.17.5"
 rayon = "1.10.0"
 git2 = { version = "0.18.3", features = ["vendored-libgit2", "vendored-openssl"] }
 
+[dev-dependencies]
+assert_cmd = { version = "2.0.16", features = ["color", "color-auto"] }
+tempfile = "3.13.0"
+
 [profile.release]
 strip = true
