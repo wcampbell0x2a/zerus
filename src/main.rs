@@ -36,6 +36,10 @@ struct Args {
     /// Cache build-std depends for nightly version
     #[clap(long, value_name = "VERSION")]
     build_std: Option<String>,
+
+    /// Skip download of git index crates.io
+    #[clap(long)]
+    skip_git_index: bool,
 }
 
 fn main() {
@@ -51,14 +55,16 @@ fn main() {
     download_and_save(&args.mirror_path, crates).expect("unable to download crates");
     println!("[-] Finished downloading crates");
 
-    println!("[-] Syncing git index crates.io");
-    let repo = args.mirror_path.join("crates.io-index");
-    if repo.exists() {
-        pull(Path::new(&repo)).unwrap();
-    } else {
-        clone(Path::new(&repo)).unwrap();
+    if !args.skip_git_index {
+        println!("[-] Syncing git index crates.io");
+        let repo = args.mirror_path.join("crates.io-index");
+        if repo.exists() {
+            pull(Path::new(&repo)).unwrap();
+        } else {
+            clone(Path::new(&repo)).unwrap();
+        }
+        println!("[-] Done syncing git index crates.io");
     }
-    println!("[-] Done syncing git index crates.io");
 }
 
 /// # Returns

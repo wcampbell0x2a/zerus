@@ -26,6 +26,7 @@ Arguments:
 
 Options:
       --build-std <VERSION>  Cache build-std depends for nightly version
+      --skip-git-index       Skip download of git index crates.io
   -h, --help                 Print help
 ```
 
