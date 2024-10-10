@@ -14,6 +14,7 @@ use crate::git::{clone, pull};
 
 mod git;
 
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
 struct Crate {
     name: String,
     version: String,
@@ -142,9 +143,10 @@ pub fn get_crate_path(
 
 /// Download all crate files and put into spots that are expected by cargo from crates.io
 fn download_and_save(mirror_path: &Path, vendors: Vec<(String, Vec<Crate>)>) -> anyhow::Result<()> {
-    vendors.into_par_iter().for_each(|(workspace, crates)| {
+    vendors.into_par_iter().for_each(|(workspace, mut crates)| {
         println!("[-] Vendoring: {workspace}");
         let client = Client::new();
+        crates.sort();
         for Crate { name, version } in crates {
             let dir_crate_path = get_crate_path(mirror_path, &name, &version).unwrap();
             let crate_path = dir_crate_path.join(format!("{name}-{version}.crate"));
