@@ -81,10 +81,24 @@ fn get_deps(args: &Args) -> Option<Vec<(String, Vec<Crate>)>> {
     let mut ret = vec![];
     for workspace in workspaces {
         let mut crates = vec![];
-        let package_graph = MetadataCommand::new()
+        let package_graph = match MetadataCommand::new()
             .manifest_path(workspace.clone())
             .build_graph()
-            .unwrap();
+        {
+            Ok(p) => p,
+            Err(CommandError(_)) => {
+                if args.build_std.is_some() {
+                    println!("[!] Could not run `cargo metadata`, try `rusutp default nightly` during zerus invocation, or set $CARGO to `cargo +nightly` location");
+                } else {
+                    println!("[!] Could not run `cargo metadata`");
+                }
+                return None;
+            }
+            Err(_) => {
+                println!("[!] Could not run `cargo metadata`");
+                return None;
+            }
+        };
 
         let packages = package_graph.packages();
         for package in packages {
