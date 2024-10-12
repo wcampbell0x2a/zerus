@@ -6,6 +6,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 10-12-2024
+- Add support for latest nightly
+- Add `--skip-git-index` to not download git index crates.io
+
 ## [0.8.1] - 05-30-2024
 - Force checkout when using Fast-Forward when updating git `crates.io-index`
 

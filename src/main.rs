@@ -1,5 +1,6 @@
 mod build_std;
 use build_std::prepare_build_std;
+use guppy::errors::Error::CommandError;
 
 use std::path::{Path, PathBuf};
 use std::{fs, iter};
@@ -14,6 +15,7 @@ use crate::git::{clone, pull};
 
 mod git;
 
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
 struct Crate {
     name: String,
     version: String,
@@ -36,6 +38,10 @@ struct Args {
     /// Cache build-std depends for nightly version
     #[clap(long, value_name = "VERSION")]
     build_std: Option<String>,
+
+    /// Skip download of git index crates.io
+    #[clap(long)]
+    skip_git_index: bool,
 }
 
 fn main() {
@@ -51,14 +57,16 @@ fn main() {
     download_and_save(&args.mirror_path, crates).expect("unable to download crates");
     println!("[-] Finished downloading crates");
 
-    println!("[-] Syncing git index crates.io");
-    let repo = args.mirror_path.join("crates.io-index");
-    if repo.exists() {
-        pull(Path::new(&repo)).unwrap();
-    } else {
-        clone(Path::new(&repo)).unwrap();
+    if !args.skip_git_index {
+        println!("[-] Syncing git index crates.io");
+        let repo = args.mirror_path.join("crates.io-index");
+        if repo.exists() {
+            pull(Path::new(&repo)).unwrap();
+        } else {
+            clone(Path::new(&repo)).unwrap();
+        }
+        println!("[-] Done syncing git index crates.io");
     }
-    println!("[-] Done syncing git index crates.io");
 }
 
 /// # Returns
@@ -73,10 +81,24 @@ fn get_deps(args: &Args) -> Option<Vec<(String, Vec<Crate>)>> {
     let mut ret = vec![];
     for workspace in workspaces {
         let mut crates = vec![];
-        let package_graph = MetadataCommand::new()
+        let package_graph = match MetadataCommand::new()
             .manifest_path(workspace.clone())
             .build_graph()
-            .unwrap();
+        {
+            Ok(p) => p,
+            Err(CommandError(_)) => {
+                if args.build_std.is_some() {
+                    println!("[!] Could not run `cargo metadata`, try `rusutp default nightly` during zerus invocation, or set $CARGO to `cargo +nightly` location");
+                } else {
+                    println!("[!] Could not run `cargo metadata`");
+                }
+                return None;
+            }
+            Err(_) => {
+                println!("[!] Could not run `cargo metadata`");
+                return None;
+            }
+        };
 
         let packages = package_graph.packages();
         for package in packages {
@@ -136,9 +158,10 @@ pub fn get_crate_path(
 
 /// Download all crate files and put into spots that are expected by cargo from crates.io
 fn download_and_save(mirror_path: &Path, vendors: Vec<(String, Vec<Crate>)>) -> anyhow::Result<()> {
-    vendors.into_par_iter().for_each(|(workspace, crates)| {
+    vendors.into_par_iter().for_each(|(workspace, mut crates)| {
         println!("[-] Vendoring: {workspace}");
         let client = Client::new();
+        crates.sort();
         for Crate { name, version } in crates {
             let dir_crate_path = get_crate_path(mirror_path, &name, &version).unwrap();
             let crate_path = dir_crate_path.join(format!("{name}-{version}.crate"));
