@@ -1,6 +1,6 @@
 [package]
 name = "zerus"
-version = "0.8.1"
+version = "0.9.0"
 edition = "2021"
 authors = ["wcampbell"]
 description = "Lightweight binary to download only project required crates for offline crates.io mirror"
