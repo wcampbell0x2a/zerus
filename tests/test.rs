@@ -1,41 +1,34 @@
 use std::{
     fs::{File, OpenOptions},
     io::Write,
+    path::{Path, PathBuf},
 };
+
+use rstest::*;
 
 use assert_cmd::Command;
 use tempfile::Builder;
 
-#[test]
-fn test_old_nightly_version() {
-    let nightly_ver = "nightly-2024-05-19";
-    let path = assert_cmd::cargo::cargo_bin("zerus");
-    let mut cmd = Command::new(path);
-
+#[fixture]
+fn tmp_dir_path() -> PathBuf {
     let tmp_dir = Builder::new().tempdir_in("./").unwrap();
-    let tmp_dir_path = tmp_dir.into_path();
-    let output = cmd
-        .env("RUST_LOG", "none")
-        .args([
-            tmp_dir_path.to_str().unwrap(),
-            "--skip-git-index",
-            "--build-std",
-            nightly_ver,
-        ])
-        .output()
-        .unwrap();
+    tmp_dir.into_path()
+}
 
+#[fixture]
+fn rustup_home() -> String {
     let rustup_home_output = std::process::Command::new("rustup")
         .args(["show", "home"])
         .output()
         .unwrap();
     let rustup_home = std::str::from_utf8(&rustup_home_output.stdout).unwrap();
-    let rustup_home = rustup_home.to_string().replace("\n", "");
-    assert_eq!(
-        std::str::from_utf8(&output.stdout).unwrap(),
-        format!(
-            r#"[-] Created {}
-[-] Vendoring: {rustup_home}/toolchains/{nightly_ver}-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/test/Cargo.toml
+    rustup_home.to_string().replace("\n", "")
+}
+
+fn stdout_old(tmp_dir_path: &PathBuf, rustup_home: String) -> String {
+    format!(
+        r#"[-] Created {}
+[-] Vendoring: {rustup_home}/toolchains/{NIGHTLY_2024_05_19}-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/test/Cargo.toml
 [-] Downloading: https://static.crates.io/crates/alloc/alloc-0.0.0.crate
 [-] Downloading: https://static.crates.io/crates/allocator-api2/allocator-api2-0.2.18.crate
 [-] Downloading: https://static.crates.io/crates/cfg-if/cfg-if-1.0.0.crate
@@ -57,43 +50,14 @@ fn test_old_nightly_version() {
 [-] Downloading: https://static.crates.io/crates/unwind/unwind-0.0.0.crate
 [-] Finished downloading crates
 "#,
-            tmp_dir_path.to_str().unwrap()
-        )
-    );
-
-    test_build_std(nightly_ver, tmp_dir_path.to_path_buf(), 8081);
+        tmp_dir_path.to_str().unwrap()
+    )
 }
 
-#[test]
-fn test_new_nightly_version() {
-    let nightly_ver = "nightly-2024-10-09";
-    let path = assert_cmd::cargo::cargo_bin("zerus");
-    let mut cmd = Command::new(path);
-
-    let tmp_dir = Builder::new().tempdir_in("./").unwrap();
-    let tmp_dir_path = tmp_dir.into_path();
-    let output = cmd
-        .env("RUST_LOG", "none")
-        .args([
-            tmp_dir_path.to_str().unwrap(),
-            "--skip-git-index",
-            "--build-std",
-            nightly_ver,
-        ])
-        .output()
-        .unwrap();
-
-    let rustup_home_output = std::process::Command::new("rustup")
-        .args(["show", "home"])
-        .output()
-        .unwrap();
-    let rustup_home = std::str::from_utf8(&rustup_home_output.stdout).unwrap();
-    let rustup_home = rustup_home.to_string().replace("\n", "");
-    assert_eq!(
-        std::str::from_utf8(&output.stdout).unwrap(),
-        format!(
-            r#"[-] Created {}
-[-] Vendoring: {rustup_home}/toolchains/{nightly_ver}-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/test/Cargo.toml
+fn stdout_new(tmp_dir_path: &PathBuf, rustup_home: String) -> String {
+    format!(
+        r#"[-] Created {}
+[-] Vendoring: {rustup_home}/toolchains/{NIGHTLY_2024_10_09}-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/test/Cargo.toml
 [-] Downloading: https://static.crates.io/crates/addr2line/addr2line-0.22.0.crate
 [-] Downloading: https://static.crates.io/crates/adler/adler-1.0.2.crate
 [-] Downloading: https://static.crates.io/crates/alloc/alloc-0.0.0.crate
@@ -129,11 +93,39 @@ fn test_new_nightly_version() {
 [-] Downloading: https://static.crates.io/crates/unwind/unwind-0.0.0.crate
 [-] Finished downloading crates
 "#,
-            tmp_dir_path.to_str().unwrap()
-        )
-    );
+        tmp_dir_path.to_str().unwrap()
+    )
+}
 
-    test_build_std(nightly_ver, tmp_dir_path.to_path_buf(), 8080);
+const NIGHTLY_2024_05_19: &str = "nightly-2024-05-19";
+const NIGHTLY_2024_10_09: &str = "nightly-2024-10-09";
+
+#[rstest]
+#[case::old_nightly(stdout_old(&tmp_dir_path, rustup_home()), NIGHTLY_2024_05_19, 8080)]
+#[case::new_nightly(stdout_new(&tmp_dir_path, rustup_home()), NIGHTLY_2024_10_09, 8081)]
+fn test_vendor_and_build_std(
+    tmp_dir_path: PathBuf,
+    #[case] stdout: String,
+    #[case] nightly_ver: &str,
+    #[case] host_port: u32,
+) {
+    let path = assert_cmd::cargo::cargo_bin("zerus");
+    let mut cmd = Command::new(path);
+
+    let output = cmd
+        .env("RUST_LOG", "none")
+        .args([
+            tmp_dir_path.to_str().unwrap(),
+            "--skip-git-index",
+            "--build-std",
+            nightly_ver,
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(std::str::from_utf8(&output.stdout).unwrap(), stdout);
+
+    test_build_std(nightly_ver, tmp_dir_path.to_path_buf(), host_port);
 }
 
 fn test_build_std(nightly_ver: &str, tmp_dir_path: std::path::PathBuf, port: u32) {
