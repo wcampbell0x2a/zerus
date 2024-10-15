@@ -86,11 +86,12 @@ fn get_deps(args: &Args) -> Option<Vec<(String, Vec<Crate>)>> {
             .build_graph()
         {
             Ok(p) => p,
-            Err(CommandError(_)) => {
+            Err(CommandError(e)) => {
                 if args.build_std.is_some() {
                     println!("[!] Could not run `cargo metadata`, try `rusutp default nightly` during zerus invocation, or set $CARGO to `cargo +nightly` location");
                 } else {
-                    println!("[!] Could not run `cargo metadata`");
+                    // most likely: "error: the manifest-path must be a path to a Cargo.toml file"
+                    println!("[!] Could not run `cargo metadata`: {e:}");
                 }
                 return None;
             }
