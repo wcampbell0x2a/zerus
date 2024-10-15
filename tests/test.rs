@@ -97,15 +97,22 @@ fn stdout_new(tmp_dir_path: &PathBuf, rustup_home: String) -> String {
     )
 }
 
+#[allow(unused_variables)]
+fn stdout_cur(tmp_dir_path: &PathBuf, rustup_home: String) -> Option<String> {
+    None
+}
+
 const NIGHTLY_2024_05_19: &str = "nightly-2024-05-19";
 const NIGHTLY_2024_10_09: &str = "nightly-2024-10-09";
 
 #[rstest]
-#[case::old_nightly(stdout_old(&tmp_dir_path, rustup_home()), NIGHTLY_2024_05_19, 8080)]
-#[case::new_nightly(stdout_new(&tmp_dir_path, rustup_home()), NIGHTLY_2024_10_09, 8081)]
+#[case::old_nightly(Some(stdout_old(&tmp_dir_path, rustup_home())), NIGHTLY_2024_05_19, 8080)]
+#[case::new_nightly(Some(stdout_new(&tmp_dir_path, rustup_home())), NIGHTLY_2024_10_09, 8081)]
+#[case::cur_nightly(stdout_cur(&tmp_dir_path, rustup_home()), "nightly", 8082)]
+#[trace]
 fn test_vendor_and_build_std(
     tmp_dir_path: PathBuf,
-    #[case] stdout: String,
+    #[case] stdout: Option<String>,
     #[case] nightly_ver: &str,
     #[case] host_port: u32,
 ) {
@@ -123,7 +130,9 @@ fn test_vendor_and_build_std(
         .output()
         .unwrap();
 
-    assert_eq!(std::str::from_utf8(&output.stdout).unwrap(), stdout);
+    if let Some(stdout) = stdout {
+        assert_eq!(std::str::from_utf8(&output.stdout).unwrap(), stdout);
+    }
 
     test_build_std(nightly_ver, tmp_dir_path.to_path_buf(), host_port);
 }
