@@ -1,12 +1,14 @@
 mod build_std;
 use build_std::prepare_build_std;
+use git::write_config_json;
 use guppy::errors::Error::CommandError;
 use reqwest::StatusCode;
 
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::{fs, iter};
 
-use clap::Parser;
+use clap::{Parser, ValueHint};
 use guppy::graph::DependencyDirection;
 use guppy::MetadataCommand;
 use rayon::prelude::*;
@@ -15,6 +17,14 @@ use reqwest::blocking::Client;
 use crate::git::{clone, pull};
 
 mod git;
+
+fn validate_url(url: &str) -> Result<String, String> {
+    if url.starts_with("http://") || url.starts_with("https://") {
+        Ok(url.to_string())
+    } else {
+        Err(String::from("The URL must start with http:// or https://"))
+    }
+}
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]
 struct Crate {
@@ -37,11 +47,18 @@ struct Args {
     workspaces: Vec<String>,
 
     /// Cache build-std depends for nightly version
-    #[clap(long, value_name = "VERSION")]
+    #[arg(long, value_name = "VERSION")]
     build_std: Option<String>,
 
+    /// Hostname for git index crates.io
+    #[arg(long)]
+    #[arg(value_hint = ValueHint::Url, value_parser = validate_url)]
+    #[arg(conflicts_with = "skip_git_index")]
+    git_index_url: Option<String>,
+
     /// Skip download of git index crates.io
-    #[clap(long)]
+    #[arg(long)]
+    #[arg(conflicts_with = "git_index_url")]
     skip_git_index: bool,
 }
 
@@ -67,6 +84,16 @@ fn main() {
             clone(Path::new(&repo)).unwrap();
         }
         println!("[-] Done syncing git index crates.io");
+    }
+
+    if let Some(url) = args.git_index_url {
+        let path = args.mirror_path.join("crates.io-index").join("config.json");
+        let file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .unwrap();
+        write_config_json(&url, file).unwrap();
     }
 }
 
