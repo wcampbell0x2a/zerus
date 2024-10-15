@@ -144,29 +144,13 @@ fn test_build_std(nightly_ver: &str, tmp_dir_path: std::path::PathBuf, port: u32
         .env("RUST_LOG", "none")
         .args([
             tmp_dir_path.to_str().unwrap(),
-            // "--skip-git-index",
+            "--git-index-url",
+            "http::/127.0.0.1",
             "--build-std",
             nightly_ver,
         ])
         .output()
         .unwrap();
-
-    // modify the config.json
-    let mut file = OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(tmp_dir_path.join("crates.io-index/config.json"))
-        .unwrap();
-    file.write_all(
-        &format!(
-            r#"{{
-  "dl": "http://127.0.0.1:{port}/crates/{{prefix}}/{{crate}}/{{version}}/{{crate}}-{{version}}.crate",
-  "api": "http://127.0.0.1:{port}/crates"
-}}"#
-        )
-        .into_bytes(),
-    )
-    .unwrap();
 
     // Create a temp directory for a cargo project
     let tmp_dir_cargo = Builder::new().tempdir_in("./").unwrap();

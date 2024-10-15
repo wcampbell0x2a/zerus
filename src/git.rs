@@ -235,3 +235,15 @@ fn fast_forward(
     repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))?;
     Ok(())
 }
+
+pub fn write_config_json(url: &str, mut writer: impl Write) -> std::io::Result<()> {
+    let f = format!(
+        r#"{{
+  "dl": "{url}/crates/{{prefix}}/{{crate}}/{{version}}/{{crate}}-{{version}}.crate",
+  "api": "{url}/crates"
+}}
+"#
+    );
+    writer.write_all(f.as_bytes())?;
+    Ok(())
+}
