@@ -43,7 +43,7 @@ $ cat crates.io-index/config.json
 
 
 ## Serve mirror
-Use [miniserve](https://github.com/svenstaro/miniserve).
+Use any `http(s)` server.
 
 ### Build with mirror
 Add the following to the `.cargo/config` file(replacing IP with your ip).
@@ -53,4 +53,12 @@ registry = "sparse+http://[IP]/crates.io-index/"
 
 [source.crates-io]
 replace-with = "zerus"
+```
+
+## Margo
+Through the use of [margo](https://github.com/integer32llc/margo), you can make a alternate Cargo registry without
+downloading the entire `crates.io` git index.
+```
+$ zerus mirror ../deku/Cargo.toml --build-std nightly --skip-git-index
+$ margo add --registry my-registry-directory mirror/*/*/*/*/*/*.crate
 ```
