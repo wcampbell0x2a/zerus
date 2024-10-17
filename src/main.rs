@@ -1,6 +1,7 @@
 mod build_std;
 use build_std::prepare_build_std;
 use guppy::errors::Error::CommandError;
+use reqwest::StatusCode;
 
 use std::path::{Path, PathBuf};
 use std::{fs, iter};
@@ -173,11 +174,16 @@ fn download_and_save(mirror_path: &Path, vendors: Vec<(String, Vec<Crate>)>) -> 
                 let url = format!("https://static.crates.io/crates/{name}/{name}-{version}.crate");
                 println!("[-] Downloading: {url}");
                 let Ok(response) = client.get(url).send() else {
-                    break;
+                    return;
                 };
 
+                if response.status() != StatusCode::OK {
+                    println!("[-] Couldn't download {name}-{version}, not hosted on crates.io");
+                    return;
+                }
+
                 let Ok(response) = response.bytes() else {
-                    break;
+                    return;
                 };
 
                 fs::create_dir_all(&dir_crate_path).unwrap();
