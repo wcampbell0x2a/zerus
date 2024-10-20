@@ -1,6 +1,7 @@
 mod build_std;
 use build_std::prepare_build_std;
 use guppy::errors::Error::CommandError;
+use reqwest::StatusCode;
 
 use std::path::{Path, PathBuf};
 use std::{fs, iter};
@@ -15,7 +16,7 @@ use crate::git::{clone, pull};
 
 mod git;
 
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]
 struct Crate {
     name: String,
     version: String,
@@ -107,10 +108,10 @@ fn get_deps(args: &Args) -> Option<Vec<(String, Vec<Crate>)>> {
             let query = package_graph.query_forward(iter::once(id)).unwrap();
             let package_set = query.resolve();
             for package in package_set.packages(DependencyDirection::Forward) {
-                crates.push(Crate::new(
-                    package.name().to_string(),
-                    package.version().to_string(),
-                ));
+                let c = Crate::new(package.name().to_string(), package.version().to_string());
+                if !crates.contains(&c) {
+                    crates.push(c);
+                }
             }
         }
         ret.push((workspace.clone(), crates));
@@ -163,27 +164,34 @@ fn download_and_save(mirror_path: &Path, vendors: Vec<(String, Vec<Crate>)>) -> 
         println!("[-] Vendoring: {workspace}");
         let client = Client::new();
         crates.sort();
-        for Crate { name, version } in crates {
+
+        crates.into_par_iter().for_each(|c| {
+            let Crate { name, version } = c;
             let dir_crate_path = get_crate_path(mirror_path, &name, &version).unwrap();
             let crate_path = dir_crate_path.join(format!("{name}-{version}.crate"));
 
             // check if file already exists
-            while fs::metadata(crate_path.clone()).is_err() {
+            if !fs::exists(&crate_path).unwrap() {
                 // download
                 let url = format!("https://static.crates.io/crates/{name}/{name}-{version}.crate");
                 println!("[-] Downloading: {url}");
                 let Ok(response) = client.get(url).send() else {
-                    break;
+                    return;
                 };
 
+                if response.status() != StatusCode::OK {
+                    println!("[-] Couldn't download {name}-{version}, not hosted on crates.io");
+                    return;
+                }
+
                 let Ok(response) = response.bytes() else {
-                    break;
+                    return;
                 };
 
                 fs::create_dir_all(&dir_crate_path).unwrap();
                 fs::write(crate_path.clone(), response).unwrap();
             }
-        }
+        })
     });
 
     Ok(())
