@@ -1,14 +1,9 @@
+use std::cell::RefCell;
 use std::io::Write;
-use std::{
-    cell::RefCell,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
-use git2::AutotagOption;
-use git2::{
-    build::{CheckoutBuilder, RepoBuilder},
-    FetchOptions, Progress, RemoteCallbacks, Repository,
-};
+use git2::build::{CheckoutBuilder, RepoBuilder};
+use git2::{AutotagOption, FetchOptions, Progress, RemoteCallbacks, RemoteUpdateFlags, Repository};
 
 struct State {
     progress: Option<Progress<'static>>,
@@ -186,7 +181,12 @@ pub fn pull(repo: &Path) -> Result<(), git2::Error> {
     // commits. This may be needed even if there was no packfile to download,
     // which can happen e.g. when the branches have been changed but all the
     // needed objects are available locally.
-    remote.update_tips(None, true, AutotagOption::Unspecified, None)?;
+    remote.update_tips(
+        None,
+        RemoteUpdateFlags::UPDATE_FETCHHEAD,
+        AutotagOption::Unspecified,
+        None,
+    )?;
 
     let fetch_head = repo.find_reference("FETCH_HEAD")?;
     let fetch_commit = repo.reference_to_annotated_commit(&fetch_head)?;
