@@ -25,20 +25,15 @@ Arguments:
   [WORKSPACES]...  list of Cargo.toml files to vendor depends
 
 Options:
-      --build-std <VERSION>  Cache build-std depends for nightly version
-      --skip-git-index       Skip download of git index crates.io
-  -h, --help                 Print help
+      --build-std <VERSION>            Cache build-std depends for nightly version
+      --git-index-url <GIT_INDEX_URL>  hostname for git index crates.io
+      --skip-git-index                 Skip download of git index crates.io
+  -h, --help                           Print help
 ```
 
 Example:
 ```console
-$ zerus new-mirror ../deku/Cargo.toml ../adsb_deku/Cargo.toml
-# configure crates.io-index to point to our host
-$ cat crates.io-index/config.json
-{
-  "dl": "http://[IP]/crates/{prefix}/{crate}/{version}/{crate}-{version}.crate",
-  "api": "http://[IP]/crates"
-}
+$ zerus new-mirror ../deku/Cargo.toml ../adsb_deku/Cargo.toml --git-index-url http://127.0.0.1
 ```
 
 

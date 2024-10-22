@@ -1,6 +1,7 @@
 use std::{
     fs::{File, OpenOptions},
     io::Write,
+    process::Output,
 };
 
 use assert_cmd::Command;
@@ -25,6 +26,7 @@ fn test_old_nightly_version() {
         ])
         .output()
         .unwrap();
+    assert_success(&output);
 
     let rustup_home_output = std::process::Command::new("rustup")
         .args(["show", "home"])
@@ -90,6 +92,7 @@ fn test_new_nightly_version() {
         ])
         .output()
         .unwrap();
+    assert_success(&output);
 
     let rustup_home_output = std::process::Command::new("rustup")
         .args(["show", "home"])
@@ -164,29 +167,14 @@ fn test_build_std(nightly_ver: &str, tmp_dir_path: std::path::PathBuf, port: u32
         .env("RUST_LOG", "none")
         .args([
             tmp_dir_path.to_str().unwrap(),
-            // "--skip-git-index",
+            "--git-index-url",
+            &format!("http://127.0.0.1:{port}"),
             "--build-std",
             nightly_ver,
         ])
         .output()
         .unwrap();
-
-    // modify the config.json
-    let mut file = OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(tmp_dir_path.join("crates.io-index/config.json"))
-        .unwrap();
-    file.write_all(
-        &format!(
-            r#"{{
-  "dl": "http://127.0.0.1:{port}/crates/{{prefix}}/{{crate}}/{{version}}/{{crate}}-{{version}}.crate",
-  "api": "http://127.0.0.1:{port}/crates"
-}}"#
-        )
-        .into_bytes(),
-    )
-    .unwrap();
+    assert_success(&output);
 
     // Create a temp directory for a cargo project
     let tmp_dir_cargo = Builder::new().tempdir_in("./").unwrap();
@@ -259,5 +247,15 @@ build-std-features = ["panic_immediate_abort"]
         .current_dir(&tmp_dir_cargo_path.join("testing/"))
         .output()
         .unwrap();
-    assert!(output.status.success());
+    assert_success(&output);
+}
+
+fn assert_success(output: &Output) {
+    if !output.status.success() {
+        let stdout = String::from_utf8(output.stdout.clone()).unwrap();
+        println!("stdout: {}", stdout);
+        let stderr = String::from_utf8(output.stderr.clone()).unwrap();
+        println!("stderr: {}", stderr);
+        panic!("not success");
+    }
 }
