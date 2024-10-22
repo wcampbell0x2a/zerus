@@ -9,6 +9,7 @@ readme = "README.md"
 homepage = "https://github.com/wcampbell0x2a/zerus"
 repository = "https://github.com/wcampbell0x2a/zerus"
 categories = ["development-tools"]
+keywords = ["offline", "mirror", "crates", "download", "vendor"]
 
 [dependencies]
 clap = { version = "4.5.9", features = ["derive"] }
