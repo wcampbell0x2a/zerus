@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 10-21-2024
+- Add instructions for use with [integer32llc/Margo](https://github.com/integer32llc/margo)
+- Add `--git-index-url` to configure mirror `config.json` [#95](https://github.com/wcampbell0x2a/zerus/pull/95)
+- Add check of status code when downloading [#97](https://github.com/wcampbell0x2a/zerus/pull/97)
+- Add better message for not finding `Cargo.toml` [#96](https://github.com/wcampbell0x2a/zerus/pull/96)
+
+### Dependencies
+- Bump clap from 4.5.9 to 4.5.20
+- Bump git2 from 0.18.3 to 0.19.0
+- Bump anyhow from 1.0.82 to 1.0.90
+- Bump reqwest from 0.12.3 to 0.12.8
+
 ## [0.9.0] - 10-12-2024
 - Add support for latest nightly
 - Add `--skip-git-index` to not download git index crates.io
