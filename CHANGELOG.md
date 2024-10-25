@@ -6,6 +6,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 10-24-2024
+- Add `lto` to github release binaries
+
 ## [0.10.0] - 10-21-2024
 - Add instructions for use with [integer32llc/Margo](https://github.com/integer32llc/margo)
 - Add `--git-index-url` to configure mirror `config.json` [#95](https://github.com/wcampbell0x2a/zerus/pull/95)

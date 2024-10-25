@@ -1,6 +1,6 @@
 [package]
 name = "zerus"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2021"
 authors = ["wcampbell"]
 description = "Lightweight binary to download only project required crates for offline crates.io mirror"
@@ -24,4 +24,11 @@ assert_cmd = { version = "2.0.16", features = ["color", "color-auto"] }
 tempfile = "3.13.0"
 
 [profile.release]
+strip = true
+
+# Release(dist) binaries are setup for maximum runtime speed, at the cost of CI time
+[profile.dist]
+inherits = "release"
+codegen-units = 1
+lto = true
 strip = true

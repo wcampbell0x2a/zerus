@@ -25,7 +25,7 @@ jobs:
           target: ${{ matrix.targets }}
       - run: cargo install cargo-quickinstall
       - run: cargo quickinstall cross
-      - run: cross build --bin ${{ matrix.bins }} --locked --release --target ${{ matrix.targets }}
+      - run: cross build --bin ${{ matrix.bins }} --locked --release --target ${{ matrix.targets }} --profile=dist
 
       - name: archive
         run: |
