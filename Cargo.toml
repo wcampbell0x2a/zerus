@@ -21,7 +21,7 @@ git2 = { version = "0.19.0", features = ["vendored-libgit2", "vendored-openssl"]
 
 [dev-dependencies]
 assert_cmd = { version = "2.0.16", features = ["color", "color-auto"] }
-tempfile = "3.13.0"
+tempfile = "3.14.0"
 
 [profile.release]
 strip = true
