@@ -12,7 +12,7 @@ categories = ["development-tools"]
 keywords = ["offline", "mirror", "crates", "download", "vendor"]
 
 [dependencies]
-clap = { version = "4.5.13", features = ["derive"] }
+clap = { version = "4.5.23", features = ["derive"] }
 reqwest = { version = "0.12.8", default-features = false, features = ["blocking", "rustls-tls", "http2"] }
 anyhow = "1.0.90"
 guppy = "0.17.5"
