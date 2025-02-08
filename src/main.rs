@@ -39,6 +39,7 @@ impl Crate {
 }
 
 #[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// new directory to contain offline mirror crate files
     mirror_path: PathBuf,

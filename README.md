@@ -26,9 +26,10 @@ Arguments:
 
 Options:
       --build-std <VERSION>            Cache build-std depends for nightly version
-      --git-index-url <GIT_INDEX_URL>  hostname for git index crates.io
+      --git-index-url <GIT_INDEX_URL>  Hostname for git index crates.io
       --skip-git-index                 Skip download of git index crates.io
   -h, --help                           Print help
+  -V, --version                        Print version
 ```
 
 Example:
