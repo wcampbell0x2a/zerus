@@ -39,6 +39,7 @@ impl Crate {
 }
 
 #[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// new directory to contain offline mirror crate files
     mirror_path: PathBuf,
@@ -207,7 +208,7 @@ fn download_and_save(mirror_path: &Path, vendors: Vec<(String, Vec<Crate>)>) -> 
                 };
 
                 if response.status() != StatusCode::OK {
-                    println!("[-] Couldn't download {name}-{version}, not hosted on crates.io");
+                    println!("[-] Couldn't download {name}-{version}, not hosted on crates.io (this is fine if it's rustc internal library");
                     return;
                 }
 

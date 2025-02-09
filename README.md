@@ -26,16 +26,22 @@ Arguments:
 
 Options:
       --build-std <VERSION>            Cache build-std depends for nightly version
-      --git-index-url <GIT_INDEX_URL>  hostname for git index crates.io
+      --git-index-url <GIT_INDEX_URL>  Hostname for git index crates.io
       --skip-git-index                 Skip download of git index crates.io
   -h, --help                           Print help
+  -V, --version                        Print version
 ```
 
-Example:
+Example of adding dependencies of two projects, meant to be hosted on `127.0.0.1`.
 ```console
 $ zerus new-mirror ../deku/Cargo.toml ../adsb_deku/Cargo.toml --git-index-url http://127.0.0.1
 ```
 
+Adding the top 100 rust crates used by rust-playground is easy:
+```console
+$ git clone https://github.com/rust-lang/rust-playground
+$ zerus new-mirror rust-playground/top-crates/Cargo.toml
+```
 
 ## Serve mirror
 Use any `http(s)` server.

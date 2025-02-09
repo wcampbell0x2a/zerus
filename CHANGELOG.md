@@ -5,6 +5,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+- Add `-V` for version, and about text to help output
+- Add instructions for using https://github.com/rust-lang/rust-playground
+- Update depends
 
 ## [0.10.1] - 10-24-2024
 - Add `lto` to github release binaries
