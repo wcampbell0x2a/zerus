@@ -1,0 +1,33 @@
+---
+source: tests/test.rs
+expression: output
+snapshot_kind: text
+---
+[-] Created <TMP_DIR>
+[-] Vendoring: <RUSTUP_HOME>/toolchains/<NIGHTLY_VER>-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/test/Cargo.toml
+[-] Downloading: https://static.crates.io/crates/alloc/alloc-0.0.0.crate
+[-] Couldn't download alloc-0.0.0, not hosted on crates.io (this is fine if it's rustc internal library
+[-] Downloading: https://static.crates.io/crates/allocator-api2/allocator-api2-0.2.18.crate
+[-] Downloading: https://static.crates.io/crates/cfg-if/cfg-if-1.0.0.crate
+[-] Downloading: https://static.crates.io/crates/compiler_builtins/compiler_builtins-0.1.109.crate
+[-] Downloading: https://static.crates.io/crates/core/core-0.0.0.crate
+[-] Couldn't download core-0.0.0, not hosted on crates.io (this is fine if it's rustc internal library
+[-] Downloading: https://static.crates.io/crates/getopts/getopts-0.2.21.crate
+[-] Downloading: https://static.crates.io/crates/hashbrown/hashbrown-0.14.5.crate
+[-] Downloading: https://static.crates.io/crates/libc/libc-0.2.153.crate
+[-] Downloading: https://static.crates.io/crates/panic_abort/panic_abort-0.0.0.crate
+[-] Couldn't download panic_abort-0.0.0, not hosted on crates.io (this is fine if it's rustc internal library
+[-] Downloading: https://static.crates.io/crates/panic_unwind/panic_unwind-0.0.0.crate
+[-] Downloading: https://static.crates.io/crates/rustc-demangle/rustc-demangle-0.1.24.crate
+[-] Downloading: https://static.crates.io/crates/rustc-std-workspace-alloc/rustc-std-workspace-alloc-1.0.1.crate
+[-] Downloading: https://static.crates.io/crates/rustc-std-workspace-core/rustc-std-workspace-core-1.0.1.crate
+[-] Downloading: https://static.crates.io/crates/rustc-std-workspace-std/rustc-std-workspace-std-1.0.1.crate
+[-] Downloading: https://static.crates.io/crates/std/std-0.0.0.crate
+[-] Couldn't download std-0.0.0, not hosted on crates.io (this is fine if it's rustc internal library
+[-] Downloading: https://static.crates.io/crates/std_detect/std_detect-0.1.5.crate
+[-] Downloading: https://static.crates.io/crates/test/test-0.0.0.crate
+[-] Couldn't download test-0.0.0, not hosted on crates.io (this is fine if it's rustc internal library
+[-] Downloading: https://static.crates.io/crates/unicode-width/unicode-width-0.1.12.crate
+[-] Downloading: https://static.crates.io/crates/unwind/unwind-0.0.0.crate
+[-] Couldn't download unwind-0.0.0, not hosted on crates.io (this is fine if it's rustc internal library
+[-] Finished downloading crates
