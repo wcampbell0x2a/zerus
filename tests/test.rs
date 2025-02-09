@@ -131,7 +131,7 @@ fn test_build_std(nightly_ver: &str, tmp_dir_path: std::path::PathBuf, port: u32
 
     // create the cargo project
     std::process::Command::new("cargo")
-        .args(["new", "testing"])
+        .args([&format!("+{nightly_ver}"), "new", "testing"])
         .current_dir(&tmp_dir_cargo_path)
         .output()
         .unwrap();
@@ -159,7 +159,6 @@ rustflags = [
     "-C", "panic=abort",
     "-C", "target-feature=+crt-static",
 ]
-
 
 [unstable]
 build-std = ["std", "panic_abort"]
