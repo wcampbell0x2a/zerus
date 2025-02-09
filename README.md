@@ -48,7 +48,7 @@ Use any `http(s)` server.
 
 ### Build with mirror
 Add the following to the `.cargo/config` file(replacing IP with your ip).
-```
+```toml
 [source.zerus]
 registry = "sparse+http://[IP]/crates.io-index/"
 
