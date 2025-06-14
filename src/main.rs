@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::{fs, iter};
 
 use clap::{Parser, ValueHint};
-use guppy::graph::DependencyDirection;
 use guppy::MetadataCommand;
+use guppy::graph::DependencyDirection;
 use rayon::prelude::*;
 use reqwest::blocking::Client;
 
@@ -117,7 +117,9 @@ fn get_deps(args: &Args) -> Option<Vec<(String, Vec<Crate>)>> {
             Ok(p) => p,
             Err(CommandError(e)) => {
                 if args.build_std.is_some() {
-                    println!("[!] Could not run `cargo metadata`, try `rusutp default nightly` during zerus invocation, or set $CARGO to `cargo +nightly` location");
+                    println!(
+                        "[!] Could not run `cargo metadata`, try `rusutp default nightly` during zerus invocation, or set $CARGO to `cargo +nightly` location"
+                    );
                 } else {
                     // most likely: "error: the manifest-path must be a path to a Cargo.toml file"
                     println!("[!] Could not run `cargo metadata`: {e:}");
