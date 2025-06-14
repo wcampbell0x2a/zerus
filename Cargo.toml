@@ -1,7 +1,7 @@
 [package]
 name = "zerus"
 version = "0.11.0"
-edition = "2021"
+edition = "2024"
 authors = ["wcampbell"]
 description = "Lightweight binary to download only project required crates for offline crates.io mirror"
 license = "MIT OR Apache-2.0"
