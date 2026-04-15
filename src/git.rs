@@ -84,6 +84,7 @@ pub fn clone(repo_path: &Path) -> Result<(), git2::Error> {
 
     let mut fo = FetchOptions::new();
     fo.remote_callbacks(cb);
+    fo.depth(1);
     RepoBuilder::new()
         .fetch_options(fo)
         .with_checkout(co)
