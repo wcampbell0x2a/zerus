@@ -6,6 +6,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 04-16-2026
+- Enable all features to get all child crates for every feature
+- Limit Fetch depth to 1 for git
+
 ## [0.11.0] - 02-09-2025
 - Add `-V` for version, and about text to help output
 - Add instructions for using https://github.com/rust-lang/rust-playground
