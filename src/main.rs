@@ -4,9 +4,9 @@ use git::write_config_json;
 use guppy::errors::Error::CommandError;
 use reqwest::StatusCode;
 
+use std::fs;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
-use std::{fs, iter};
 
 use clap::{Parser, ValueHint};
 use guppy::graph::DependencyDirection;
@@ -101,19 +101,22 @@ fn main() {
 /// # Returns
 /// `Vec<Workspace, Vec<Crate>>`
 fn get_deps(args: &Args) -> Option<Vec<(String, Vec<Crate>)>> {
-    let mut workspaces = args.workspaces.clone();
+    let mut workspaces: Vec<(String, bool)> =
+        args.workspaces.iter().map(|w| (w.clone(), true)).collect();
     if let Some(version) = &args.build_std {
         let build_std = prepare_build_std(version)?;
-        workspaces.push(build_std);
+        workspaces.push((build_std, false));
     }
 
     let mut ret = vec![];
-    for workspace in workspaces {
+    for (workspace, use_all_features) in workspaces {
         let mut crates = vec![];
-        let package_graph = match MetadataCommand::new()
-            .manifest_path(workspace.clone())
-            .build_graph()
-        {
+        let mut cmd = MetadataCommand::new();
+        cmd.manifest_path(workspace.clone());
+        if use_all_features {
+            cmd.other_options(["--all-features"]);
+        }
+        let package_graph = match cmd.build_graph() {
             Ok(p) => p,
             Err(CommandError(e)) => {
                 if args.build_std.is_some() {
@@ -130,16 +133,13 @@ fn get_deps(args: &Args) -> Option<Vec<(String, Vec<Crate>)>> {
             }
         };
 
-        let packages = package_graph.packages();
-        for package in packages {
-            let id = package.id();
-            let query = package_graph.query_forward(iter::once(id)).unwrap();
-            let package_set = query.resolve();
-            for package in package_set.packages(DependencyDirection::Forward) {
-                let c = Crate::new(package.name().to_string(), package.version().to_string());
-                if !crates.contains(&c) {
-                    crates.push(c);
-                }
+        let feature_graph = package_graph.feature_graph();
+        let feature_set = feature_graph.resolve_all();
+        let package_set = feature_set.to_package_set();
+        for package in package_set.packages(DependencyDirection::Forward) {
+            let c = Crate::new(package.name().to_string(), package.version().to_string());
+            if !crates.contains(&c) {
+                crates.push(c);
             }
         }
         ret.push((workspace.clone(), crates));
@@ -208,7 +208,7 @@ fn download_and_save(mirror_path: &Path, vendors: Vec<(String, Vec<Crate>)>) -> 
                 };
 
                 if response.status() != StatusCode::OK {
-                    println!("[-] Couldn't download {name}-{version}, not hosted on crates.io (this is fine if it's rustc internal library");
+                    println!("[-] Couldn't download {name}-{version}, not hosted on crates.io (this is fine if it's rustc internal library)");
                     return;
                 }
 
