@@ -56,6 +56,12 @@ registry = "sparse+http://[IP]/crates.io-index/"
 replace-with = "zerus"
 ```
 
+## Update Index
+Generate a registry index directly from `.crate` files, without needing the full `crates.io` git index.
+```console
+$ zerus update-index ./index ./crates --dl-url http://127.0.0.1
+```
+
 ## Margo
 Through the use of [margo](https://github.com/integer32llc/margo), you can make a alternate Cargo registry without
 downloading the entire `crates.io` git index.

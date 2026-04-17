@@ -5,6 +5,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+- Add `update-index` subcommand to generate registry index from `.crate` files
 
 ## [0.12.0] - 04-16-2026
 - Enable all features to get all child crates for every feature
