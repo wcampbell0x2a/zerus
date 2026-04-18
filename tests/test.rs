@@ -1,8 +1,4 @@
-use std::{
-    fs::{File, OpenOptions},
-    io::Write,
-    process::Output,
-};
+use std::{fs::File, io::Write, process::Output};
 
 use assert_cmd::Command;
 use insta::assert_snapshot;
@@ -15,7 +11,7 @@ fn test_old_nightly_version() {
     let mut cmd = Command::new(path);
 
     let tmp_dir = Builder::new().tempdir_in("./").unwrap();
-    let tmp_dir_path = tmp_dir.into_path();
+    let tmp_dir_path = tmp_dir.keep();
     let output = cmd
         .env("RUST_LOG", "none")
         .env("RAYON_NUM_THREADS", "1") // deterministic ordering
@@ -39,13 +35,13 @@ fn test_old_nightly_version() {
 
     // replace Create <TMP_DIR>
     let tmp_dir = tmp_dir_path.to_str().unwrap();
-    let output = output.replace(&tmp_dir, "<TMP_DIR>");
+    let output = output.replace(tmp_dir, "<TMP_DIR>");
 
     // replace RUSTUP_HOME
     let output = output.replace(&rustup_home, "<RUSTUP_HOME>");
 
     // replace NIGHTLY_VER
-    let output = output.replace(&nightly_ver, "<NIGHTLY_VER>");
+    let output = output.replace(nightly_ver, "<NIGHTLY_VER>");
 
     assert_snapshot!(output);
 
@@ -59,7 +55,7 @@ fn test_new_nightly_version() {
     let mut cmd = Command::new(path);
 
     let tmp_dir = Builder::new().tempdir_in("./").unwrap();
-    let tmp_dir_path = tmp_dir.into_path();
+    let tmp_dir_path = tmp_dir.keep();
     let output = cmd
         .env("RUST_LOG", "none")
         .env("RAYON_NUM_THREADS", "1") // deterministic ordering
@@ -83,13 +79,13 @@ fn test_new_nightly_version() {
 
     // replace Create <TMP_DIR>
     let tmp_dir = tmp_dir_path.to_str().unwrap();
-    let output = output.replace(&tmp_dir, "<TMP_DIR>");
+    let output = output.replace(tmp_dir, "<TMP_DIR>");
 
     // replace RUSTUP_HOME
     let output = output.replace(&rustup_home, "<RUSTUP_HOME>");
 
     // replace NIGHTLY_VER
-    let output = output.replace(&nightly_ver, "<NIGHTLY_VER>");
+    let output = output.replace(nightly_ver, "<NIGHTLY_VER>");
 
     assert_snapshot!(output);
 
@@ -117,10 +113,10 @@ fn test_build_std(nightly_ver: &str, tmp_dir_path: std::path::PathBuf, port: u32
 
     // Create a temp directory for a cargo project
     let tmp_dir_cargo = Builder::new().tempdir_in("./").unwrap();
-    let tmp_dir_cargo_path = tmp_dir_cargo.into_path();
+    let tmp_dir_cargo_path = tmp_dir_cargo.keep();
 
     // host the crates with a dummy python3 http server
-    let mut server_handle = std::process::Command::new("python3")
+    let _server_handle = std::process::Command::new("python3")
         .args([
             "-m",
             "http.server",
@@ -139,14 +135,14 @@ fn test_build_std(nightly_ver: &str, tmp_dir_path: std::path::PathBuf, port: u32
         .unwrap();
     std::process::Command::new("mkdir")
         .args(["-p", ".cargo"])
-        .current_dir(&tmp_dir_cargo_path.join("testing/"))
+        .current_dir(tmp_dir_cargo_path.join("testing/"))
         .output()
         .unwrap();
     // write a config file
     // 1. static binary
     // 2. build-std
     // 3. use our crates
-    let mut file = File::create(&tmp_dir_cargo_path.join("testing/.cargo/config.toml")).unwrap();
+    let mut file = File::create(tmp_dir_cargo_path.join("testing/.cargo/config.toml")).unwrap();
     file.write_all(
         &format!(
             r#"
@@ -182,7 +178,7 @@ build-std-features = ["panic_immediate_abort"]
         ])
         // Allow access to local python server
         .env("CROSS_CONTAINER_OPTS", "--network=host")
-        .current_dir(&tmp_dir_cargo_path.join("testing/"))
+        .current_dir(tmp_dir_cargo_path.join("testing/"))
         .output()
         .unwrap();
     assert_success(&output);
