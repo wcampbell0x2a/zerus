@@ -20,8 +20,8 @@ fn test_old_nightly_version() {
         .env("RUST_LOG", "none")
         .env("RAYON_NUM_THREADS", "1") // deterministic ordering
         .args([
+            "mirror",
             tmp_dir_path.to_str().unwrap(),
-            "--skip-git-index",
             "--build-std",
             nightly_ver,
         ])
@@ -64,8 +64,8 @@ fn test_new_nightly_version() {
         .env("RUST_LOG", "none")
         .env("RAYON_NUM_THREADS", "1") // deterministic ordering
         .args([
+            "mirror",
             tmp_dir_path.to_str().unwrap(),
-            "--skip-git-index",
             "--build-std",
             nightly_ver,
         ])
@@ -103,7 +103,9 @@ fn test_build_std(nightly_ver: &str, tmp_dir_path: std::path::PathBuf, port: u32
     let output = cmd
         .env("RUST_LOG", "none")
         .args([
+            "mirror",
             tmp_dir_path.to_str().unwrap(),
+            "--git-index",
             "--git-index-url",
             &format!("http://127.0.0.1:{port}"),
             "--build-std",

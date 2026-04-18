@@ -17,49 +17,37 @@ $ cargo install zerus --locked
 Or download from [github releases](https://github.com/wcampbell0x2a/zerus/releases).
 
 ## Usage
+
+### Download crates
+Use `zerus mirror` to download `.crate` files for your project's dependencies.
 ```console
-Usage: zerus [OPTIONS] <MIRROR_PATH> [WORKSPACES]...
-
-Arguments:
-  <MIRROR_PATH>    new directory to contain offline mirror crate files
-  [WORKSPACES]...  list of Cargo.toml files to vendor depends
-
-Options:
-      --build-std <VERSION>            Cache build-std depends for nightly version
-      --git-index-url <GIT_INDEX_URL>  Hostname for git index crates.io
-      --skip-git-index                 Skip download of git index crates.io
-  -h, --help                           Print help
-  -V, --version                        Print version
-```
-
-Example of adding dependencies of two projects, meant to be hosted on `127.0.0.1`.
-```console
-$ zerus new-mirror ../deku/Cargo.toml ../adsb_deku/Cargo.toml --git-index-url http://127.0.0.1
+$ zerus mirror new-mirror ../deku/Cargo.toml ../adsb_deku/Cargo.toml
 ```
 
 Adding the top 100 rust crates used by rust-playground is easy:
 ```console
 $ git clone https://github.com/rust-lang/rust-playground
-$ zerus new-mirror rust-playground/top-crates/Cargo.toml
+$ zerus mirror new-mirror rust-playground/top-crates/Cargo.toml
 ```
 
-## Serve mirror
-Use any `http(s)` server.
+### Transfer to offline network
+Copy the mirror directory to your proxy or offline network.
+
+### Generate index
+On the offline network, use `update-index` to generate a registry index from the `.crate` files.
+```console
+$ zerus update-index new-mirror --dl-url http://[IP]
+```
+
+### Serve mirror
+Use any `http(s)` server to host the mirror directory.
 
 ### Build with mirror
-Add the following to the `.cargo/config` file(replacing IP with your ip).
+Add the following to `.cargo/config.toml` (replacing `[IP]` with your server address).
 ```toml
 [source.zerus]
 registry = "sparse+http://[IP]/crates.io-index/"
 
 [source.crates-io]
 replace-with = "zerus"
-```
-
-## Margo
-Through the use of [margo](https://github.com/integer32llc/margo), you can make a alternate Cargo registry without
-downloading the entire `crates.io` git index.
-```
-$ zerus mirror ../deku/Cargo.toml --build-std nightly --skip-git-index
-$ margo add --registry my-registry-directory mirror/*/*/*/*/*/*.crate
 ```
