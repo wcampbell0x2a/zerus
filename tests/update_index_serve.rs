@@ -95,7 +95,7 @@ fn test_update_index_serve_and_cargo_build_itoa() {
         .unwrap();
     let root = tmp.path();
     let crates_dir = root.join("crates");
-    let index_dir = root.join("index");
+    let index_dir = root.join("crates.io-index");
 
     download_crate(&crates_dir, "itoa", "1.0.14");
 
@@ -103,8 +103,7 @@ fn test_update_index_serve_and_cargo_build_itoa() {
     let output = zerus_cmd()
         .args([
             "update-index",
-            index_dir.to_str().unwrap(),
-            crates_dir.to_str().unwrap(),
+            root.to_str().unwrap(),
             "--dl-url",
             &server_url,
         ])
@@ -171,7 +170,7 @@ itoa = "=1.0.14"
         project_dir.join(".cargo/config.toml"),
         format!(
             r#"[source.zerus-test]
-registry = "sparse+http://127.0.0.1:{port}/index/"
+registry = "sparse+http://127.0.0.1:{port}/crates.io-index/"
 
 [source.crates-io]
 replace-with = "zerus-test"
@@ -199,7 +198,7 @@ fn test_update_index_serve_and_cargo_build_multiple_crates() {
         .unwrap();
     let root = tmp.path();
     let crates_dir = root.join("crates");
-    let index_dir = root.join("index");
+    let index_dir = root.join("crates.io-index");
 
     download_crate(&crates_dir, "itoa", "1.0.14");
     download_crate(&crates_dir, "memchr", "2.7.4");
@@ -208,8 +207,7 @@ fn test_update_index_serve_and_cargo_build_multiple_crates() {
     let output = zerus_cmd()
         .args([
             "update-index",
-            index_dir.to_str().unwrap(),
-            crates_dir.to_str().unwrap(),
+            root.to_str().unwrap(),
             "--dl-url",
             &server_url,
         ])
@@ -271,7 +269,7 @@ memchr = "=2.7.4"
         project_dir.join(".cargo/config.toml"),
         format!(
             r#"[source.zerus-test]
-registry = "sparse+http://127.0.0.1:{port}/index/"
+registry = "sparse+http://127.0.0.1:{port}/crates.io-index/"
 
 [source.crates-io]
 replace-with = "zerus-test"

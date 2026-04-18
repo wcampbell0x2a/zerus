@@ -78,18 +78,15 @@ fn read_index_entries(index_path: &Path, crate_name: &str) -> Vec<serde_json::Va
 #[test]
 fn test_update_index_basic() {
     let tmp = TempDir::new().unwrap();
-    let crates_dir = tmp.path().join("crates");
-    let index_dir = tmp.path().join("index");
+    let mirror_dir = tmp.path();
+    let crates_dir = mirror_dir.join("crates");
+    let index_dir = mirror_dir.join("crates.io-index");
     fs::create_dir_all(&crates_dir).unwrap();
 
     create_simple_crate(&crates_dir, "mycrate", "0.1.0");
 
     let output = zerus_cmd()
-        .args([
-            "update-index",
-            index_dir.to_str().unwrap(),
-            crates_dir.to_str().unwrap(),
-        ])
+        .args(["update-index", mirror_dir.to_str().unwrap()])
         .output()
         .unwrap();
     assert_success(&output);
@@ -113,19 +110,16 @@ fn test_update_index_basic() {
 #[test]
 fn test_update_index_multiple_versions() {
     let tmp = TempDir::new().unwrap();
-    let crates_dir = tmp.path().join("crates");
-    let index_dir = tmp.path().join("index");
+    let mirror_dir = tmp.path();
+    let crates_dir = mirror_dir.join("crates");
+    let index_dir = mirror_dir.join("crates.io-index");
     fs::create_dir_all(&crates_dir).unwrap();
 
     create_simple_crate(&crates_dir, "mycrate", "0.1.0");
     create_simple_crate(&crates_dir, "mycrate", "0.2.0");
 
     let output = zerus_cmd()
-        .args([
-            "update-index",
-            index_dir.to_str().unwrap(),
-            crates_dir.to_str().unwrap(),
-        ])
+        .args(["update-index", mirror_dir.to_str().unwrap()])
         .output()
         .unwrap();
     assert_success(&output);
@@ -141,19 +135,16 @@ fn test_update_index_multiple_versions() {
 #[test]
 fn test_update_index_multiple_crates() {
     let tmp = TempDir::new().unwrap();
-    let crates_dir = tmp.path().join("crates");
-    let index_dir = tmp.path().join("index");
+    let mirror_dir = tmp.path();
+    let crates_dir = mirror_dir.join("crates");
+    let index_dir = mirror_dir.join("crates.io-index");
     fs::create_dir_all(&crates_dir).unwrap();
 
     create_simple_crate(&crates_dir, "alpha", "1.0.0");
     create_simple_crate(&crates_dir, "beta", "2.0.0");
 
     let output = zerus_cmd()
-        .args([
-            "update-index",
-            index_dir.to_str().unwrap(),
-            crates_dir.to_str().unwrap(),
-        ])
+        .args(["update-index", mirror_dir.to_str().unwrap()])
         .output()
         .unwrap();
     assert_success(&output);
@@ -173,20 +164,17 @@ fn test_update_index_multiple_crates() {
 #[test]
 fn test_update_index_nested_crate_files() {
     let tmp = TempDir::new().unwrap();
-    let crates_dir = tmp.path().join("crates");
+    let mirror_dir = tmp.path();
+    let crates_dir = mirror_dir.join("crates");
     let sub_dir = crates_dir.join("sub").join("dir");
-    let index_dir = tmp.path().join("index");
+    let index_dir = mirror_dir.join("crates.io-index");
     fs::create_dir_all(&sub_dir).unwrap();
 
     // Put .crate in a nested subdirectory
     create_simple_crate(&sub_dir, "nested", "0.1.0");
 
     let output = zerus_cmd()
-        .args([
-            "update-index",
-            index_dir.to_str().unwrap(),
-            crates_dir.to_str().unwrap(),
-        ])
+        .args(["update-index", mirror_dir.to_str().unwrap()])
         .output()
         .unwrap();
     assert_success(&output);
@@ -199,8 +187,9 @@ fn test_update_index_nested_crate_files() {
 #[test]
 fn test_update_index_dl_url_writes_config_json() {
     let tmp = TempDir::new().unwrap();
-    let crates_dir = tmp.path().join("crates");
-    let index_dir = tmp.path().join("index");
+    let mirror_dir = tmp.path();
+    let crates_dir = mirror_dir.join("crates");
+    let index_dir = mirror_dir.join("crates.io-index");
     fs::create_dir_all(&crates_dir).unwrap();
 
     create_simple_crate(&crates_dir, "mycrate", "0.1.0");
@@ -208,8 +197,7 @@ fn test_update_index_dl_url_writes_config_json() {
     let output = zerus_cmd()
         .args([
             "update-index",
-            index_dir.to_str().unwrap(),
-            crates_dir.to_str().unwrap(),
+            mirror_dir.to_str().unwrap(),
             "--dl-url",
             "http://myserver.local",
         ])
@@ -231,18 +219,15 @@ fn test_update_index_dl_url_writes_config_json() {
 #[test]
 fn test_update_index_no_dl_url_no_config_json() {
     let tmp = TempDir::new().unwrap();
-    let crates_dir = tmp.path().join("crates");
-    let index_dir = tmp.path().join("index");
+    let mirror_dir = tmp.path();
+    let crates_dir = mirror_dir.join("crates");
+    let index_dir = mirror_dir.join("crates.io-index");
     fs::create_dir_all(&crates_dir).unwrap();
 
     create_simple_crate(&crates_dir, "mycrate", "0.1.0");
 
     let output = zerus_cmd()
-        .args([
-            "update-index",
-            index_dir.to_str().unwrap(),
-            crates_dir.to_str().unwrap(),
-        ])
+        .args(["update-index", mirror_dir.to_str().unwrap()])
         .output()
         .unwrap();
     assert_success(&output);
@@ -257,16 +242,12 @@ fn test_update_index_no_dl_url_no_config_json() {
 #[test]
 fn test_update_index_empty_crates_dir() {
     let tmp = TempDir::new().unwrap();
-    let crates_dir = tmp.path().join("crates");
-    let index_dir = tmp.path().join("index");
+    let mirror_dir = tmp.path();
+    let crates_dir = mirror_dir.join("crates");
     fs::create_dir_all(&crates_dir).unwrap();
 
     let output = zerus_cmd()
-        .args([
-            "update-index",
-            index_dir.to_str().unwrap(),
-            crates_dir.to_str().unwrap(),
-        ])
+        .args(["update-index", mirror_dir.to_str().unwrap()])
         .output()
         .unwrap();
     assert_success(&output);
@@ -278,8 +259,9 @@ fn test_update_index_empty_crates_dir() {
 #[test]
 fn test_update_index_deps_in_index_entry() {
     let tmp = TempDir::new().unwrap();
-    let crates_dir = tmp.path().join("crates");
-    let index_dir = tmp.path().join("index");
+    let mirror_dir = tmp.path();
+    let crates_dir = mirror_dir.join("crates");
+    let index_dir = mirror_dir.join("crates.io-index");
     fs::create_dir_all(&crates_dir).unwrap();
 
     let cargo_toml = r#"[package]
@@ -303,11 +285,7 @@ extra = ["log"]
     create_test_crate(&crates_dir, "deptest", "0.3.0", cargo_toml);
 
     let output = zerus_cmd()
-        .args([
-            "update-index",
-            index_dir.to_str().unwrap(),
-            crates_dir.to_str().unwrap(),
-        ])
+        .args(["update-index", mirror_dir.to_str().unwrap()])
         .output()
         .unwrap();
     assert_success(&output);
@@ -348,8 +326,9 @@ extra = ["log"]
 #[test]
 fn test_update_index_detailed_dependency() {
     let tmp = TempDir::new().unwrap();
-    let crates_dir = tmp.path().join("crates");
-    let index_dir = tmp.path().join("index");
+    let mirror_dir = tmp.path();
+    let crates_dir = mirror_dir.join("crates");
+    let index_dir = mirror_dir.join("crates.io-index");
     fs::create_dir_all(&crates_dir).unwrap();
 
     let cargo_toml = r#"[package]
@@ -362,11 +341,7 @@ serde = { version = "1.0", features = ["derive"], optional = true, default-featu
     create_test_crate(&crates_dir, "detailed", "1.0.0", cargo_toml);
 
     let output = zerus_cmd()
-        .args([
-            "update-index",
-            index_dir.to_str().unwrap(),
-            crates_dir.to_str().unwrap(),
-        ])
+        .args(["update-index", mirror_dir.to_str().unwrap()])
         .output()
         .unwrap();
     assert_success(&output);
@@ -392,8 +367,9 @@ serde = { version = "1.0", features = ["derive"], optional = true, default-featu
 #[test]
 fn test_update_index_target_specific_deps() {
     let tmp = TempDir::new().unwrap();
-    let crates_dir = tmp.path().join("crates");
-    let index_dir = tmp.path().join("index");
+    let mirror_dir = tmp.path();
+    let crates_dir = mirror_dir.join("crates");
+    let index_dir = mirror_dir.join("crates.io-index");
     fs::create_dir_all(&crates_dir).unwrap();
 
     let cargo_toml = r#"[package]
@@ -409,11 +385,7 @@ winapi = "0.3"
     create_test_crate(&crates_dir, "targeted", "0.1.0", cargo_toml);
 
     let output = zerus_cmd()
-        .args([
-            "update-index",
-            index_dir.to_str().unwrap(),
-            crates_dir.to_str().unwrap(),
-        ])
+        .args(["update-index", mirror_dir.to_str().unwrap()])
         .output()
         .unwrap();
     assert_success(&output);
@@ -433,8 +405,9 @@ winapi = "0.3"
 #[test]
 fn test_update_index_idempotent() {
     let tmp = TempDir::new().unwrap();
-    let crates_dir = tmp.path().join("crates");
-    let index_dir = tmp.path().join("index");
+    let mirror_dir = tmp.path();
+    let crates_dir = mirror_dir.join("crates");
+    let index_dir = mirror_dir.join("crates.io-index");
     fs::create_dir_all(&crates_dir).unwrap();
 
     create_simple_crate(&crates_dir, "mycrate", "0.1.0");
@@ -442,11 +415,7 @@ fn test_update_index_idempotent() {
     // Run twice
     for _ in 0..2 {
         let output = zerus_cmd()
-            .args([
-                "update-index",
-                index_dir.to_str().unwrap(),
-                crates_dir.to_str().unwrap(),
-            ])
+            .args(["update-index", mirror_dir.to_str().unwrap()])
             .output()
             .unwrap();
         assert_success(&output);
@@ -460,8 +429,9 @@ fn test_update_index_idempotent() {
 #[test]
 fn test_update_index_prefix_paths() {
     let tmp = TempDir::new().unwrap();
-    let crates_dir = tmp.path().join("crates");
-    let index_dir = tmp.path().join("index");
+    let mirror_dir = tmp.path();
+    let crates_dir = mirror_dir.join("crates");
+    let index_dir = mirror_dir.join("crates.io-index");
     fs::create_dir_all(&crates_dir).unwrap();
 
     // 1-char name -> prefix "1/"
@@ -474,11 +444,7 @@ fn test_update_index_prefix_paths() {
     create_simple_crate(&crates_dir, "abcd", "0.1.0");
 
     let output = zerus_cmd()
-        .args([
-            "update-index",
-            index_dir.to_str().unwrap(),
-            crates_dir.to_str().unwrap(),
-        ])
+        .args(["update-index", mirror_dir.to_str().unwrap()])
         .output()
         .unwrap();
     assert_success(&output);
@@ -492,18 +458,15 @@ fn test_update_index_prefix_paths() {
 #[test]
 fn test_update_index_checksum_is_of_crate_file() {
     let tmp = TempDir::new().unwrap();
-    let crates_dir = tmp.path().join("crates");
-    let index_dir = tmp.path().join("index");
+    let mirror_dir = tmp.path();
+    let crates_dir = mirror_dir.join("crates");
+    let index_dir = mirror_dir.join("crates.io-index");
     fs::create_dir_all(&crates_dir).unwrap();
 
     create_simple_crate(&crates_dir, "cktest", "0.1.0");
 
     let output = zerus_cmd()
-        .args([
-            "update-index",
-            index_dir.to_str().unwrap(),
-            crates_dir.to_str().unwrap(),
-        ])
+        .args(["update-index", mirror_dir.to_str().unwrap()])
         .output()
         .unwrap();
     assert_success(&output);
@@ -523,15 +486,14 @@ fn test_update_index_checksum_is_of_crate_file() {
 #[test]
 fn test_update_index_dl_url_requires_valid_url() {
     let tmp = TempDir::new().unwrap();
-    let crates_dir = tmp.path().join("crates");
-    let index_dir = tmp.path().join("index");
+    let mirror_dir = tmp.path();
+    let crates_dir = mirror_dir.join("crates");
     fs::create_dir_all(&crates_dir).unwrap();
 
     let output = zerus_cmd()
         .args([
             "update-index",
-            index_dir.to_str().unwrap(),
-            crates_dir.to_str().unwrap(),
+            mirror_dir.to_str().unwrap(),
             "--dl-url",
             "not-a-url",
         ])
@@ -549,8 +511,9 @@ fn test_update_index_dl_url_requires_valid_url() {
 #[test]
 fn test_update_index_path_only_deps_skipped() {
     let tmp = TempDir::new().unwrap();
-    let crates_dir = tmp.path().join("crates");
-    let index_dir = tmp.path().join("index");
+    let mirror_dir = tmp.path();
+    let crates_dir = mirror_dir.join("crates");
+    let index_dir = mirror_dir.join("crates.io-index");
     fs::create_dir_all(&crates_dir).unwrap();
 
     let cargo_toml = r#"[package]
@@ -564,11 +527,7 @@ real-dep = "1.0"
     create_test_crate(&crates_dir, "pathskip", "0.1.0", cargo_toml);
 
     let output = zerus_cmd()
-        .args([
-            "update-index",
-            index_dir.to_str().unwrap(),
-            crates_dir.to_str().unwrap(),
-        ])
+        .args(["update-index", mirror_dir.to_str().unwrap()])
         .output()
         .unwrap();
     assert_success(&output);

@@ -22,7 +22,6 @@ fn test_old_nightly_version() {
         .args([
             "mirror",
             tmp_dir_path.to_str().unwrap(),
-            "--skip-git-index",
             "--build-std",
             nightly_ver,
         ])
@@ -67,7 +66,6 @@ fn test_new_nightly_version() {
         .args([
             "mirror",
             tmp_dir_path.to_str().unwrap(),
-            "--skip-git-index",
             "--build-std",
             nightly_ver,
         ])
@@ -107,6 +105,7 @@ fn test_build_std(nightly_ver: &str, tmp_dir_path: std::path::PathBuf, port: u32
         .args([
             "mirror",
             tmp_dir_path.to_str().unwrap(),
+            "--git-index",
             "--git-index-url",
             &format!("http://127.0.0.1:{port}"),
             "--build-std",

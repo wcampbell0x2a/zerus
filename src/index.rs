@@ -299,6 +299,8 @@ pub fn update_index(index_path: &Path, crates_path: &Path, dl_url: Option<&str>)
             .open(config_path)
             .expect("failed to create config.json");
         crate::git::write_config_json(url, file).expect("failed to write config.json");
+    } else if !index_path.join("config.json").exists() {
+        eprintln!("[WARN] No config.json found in index and --dl-url not provided. The index will be unusable without it.");
     }
 
     println!("[-] Index updated at {}", index_path.display());

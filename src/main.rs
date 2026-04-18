@@ -63,21 +63,17 @@ enum Command {
         /// Hostname for git index crates.io
         #[arg(long)]
         #[arg(value_hint = ValueHint::Url, value_parser = validate_url)]
-        #[arg(conflicts_with = "skip_git_index")]
+        #[arg(requires = "git_index")]
         git_index_url: Option<String>,
 
-        /// Skip download of git index crates.io
+        /// Download git index crates.io
         #[arg(long)]
-        #[arg(conflicts_with = "git_index_url")]
-        skip_git_index: bool,
+        git_index: bool,
     },
     /// Generate a limited crates git index from .crate files
     UpdateIndex {
-        /// Path to write the index
-        index_path: PathBuf,
-
-        /// Path containing .crate files
-        crates_path: PathBuf,
+        /// Path to mirror directory (contains crates.io-index/ and crates/)
+        mirror_path: PathBuf,
 
         /// Download URL template for config.json
         #[arg(long)]
@@ -95,21 +91,22 @@ fn main() {
             workspaces,
             build_std,
             git_index_url,
-            skip_git_index,
+            git_index,
         } => {
             mirror(
                 mirror_path,
                 workspaces,
                 build_std,
                 git_index_url,
-                skip_git_index,
+                git_index,
             );
         }
         Command::UpdateIndex {
-            index_path,
-            crates_path,
+            mirror_path,
             dl_url,
         } => {
+            let index_path = mirror_path.join("crates.io-index");
+            let crates_path = mirror_path.join("crates");
             index::update_index(&index_path, &crates_path, dl_url.as_deref());
         }
     }
@@ -120,7 +117,7 @@ fn mirror(
     workspaces: Vec<String>,
     build_std: Option<String>,
     git_index_url: Option<String>,
-    skip_git_index: bool,
+    git_index: bool,
 ) {
     std::fs::create_dir_all(&mirror_path).unwrap();
     println!("[-] Created {}", mirror_path.display());
@@ -132,7 +129,7 @@ fn mirror(
     download_and_save(&mirror_path, crates).expect("unable to download crates");
     println!("[-] Finished downloading crates");
 
-    if !skip_git_index {
+    if git_index {
         println!("[-] Syncing git index crates.io");
         let repo = mirror_path.join("crates.io-index");
         if repo.exists() {
@@ -160,21 +157,17 @@ fn get_deps(
     workspaces: &[String],
     build_std: &Option<String>,
 ) -> Option<Vec<(String, Vec<Crate>)>> {
-    let mut workspace_list: Vec<(String, bool)> =
-        workspaces.iter().map(|w| (w.clone(), true)).collect();
+    let mut workspace_list: Vec<String> = workspaces.to_vec();
     if let Some(version) = build_std {
         let build_std_path = prepare_build_std(version)?;
-        workspace_list.push((build_std_path, false));
+        workspace_list.push(build_std_path);
     }
 
     let mut ret = vec![];
-    for (workspace, use_all_features) in workspace_list {
+    for workspace in workspace_list {
         let mut crates = vec![];
         let mut cmd = MetadataCommand::new();
         cmd.manifest_path(workspace.clone());
-        if use_all_features {
-            cmd.other_options(["--all-features"]);
-        }
         let package_graph = match cmd.build_graph() {
             Ok(p) => p,
             Err(CommandError(e)) => {
