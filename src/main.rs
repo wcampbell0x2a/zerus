@@ -16,6 +16,7 @@ use reqwest::blocking::Client;
 
 use crate::git::{clone, pull};
 
+mod bin_crate;
 mod git;
 mod index;
 
@@ -60,6 +61,10 @@ enum Command {
         #[arg(long, value_name = "VERSION")]
         build_std: Option<String>,
 
+        /// Mirror a binary crate and all its dependencies (NAME or NAME@VERSION)
+        #[arg(long = "crate", value_name = "NAME[@VERSION]")]
+        bin_crates: Vec<String>,
+
         /// Hostname for git index crates.io
         #[arg(long)]
         #[arg(value_hint = ValueHint::Url, value_parser = validate_url)]
@@ -90,10 +95,11 @@ fn main() {
             mirror_path,
             workspaces,
             build_std,
+            bin_crates,
             git_index_url,
             git_index,
         } => {
-            mirror(mirror_path, workspaces, build_std, git_index_url, git_index);
+            mirror(mirror_path, workspaces, build_std, bin_crates, git_index_url, git_index);
         }
         Command::UpdateIndex {
             mirror_path,
@@ -110,13 +116,33 @@ fn mirror(
     mirror_path: PathBuf,
     workspaces: Vec<String>,
     build_std: Option<String>,
+    bin_crates: Vec<String>,
     git_index_url: Option<String>,
     git_index: bool,
 ) {
     std::fs::create_dir_all(&mirror_path).unwrap();
     println!("[-] Created {}", mirror_path.display());
 
-    let Some(crates) = get_deps(&workspaces, &build_std) else {
+    // Pre-download binary crates and extract them to temp dirs so their
+    // Cargo.toml can be fed into the normal dep-resolution flow.
+    let client = reqwest::blocking::Client::new();
+    let mut extra_workspaces: Vec<String> = Vec::new();
+    let mut _tempdirs: Vec<tempfile::TempDir> = Vec::new();
+    for spec in &bin_crates {
+        match bin_crate::prepare(&client, &mirror_path, spec) {
+            Ok((tmpdir, cargo_toml)) => {
+                extra_workspaces.push(cargo_toml.to_string_lossy().into_owned());
+                _tempdirs.push(tmpdir);
+            }
+            Err(e) => {
+                println!("[!] Failed to prepare --crate {spec}: {e}");
+                return;
+            }
+        }
+    }
+
+    let all_workspaces: Vec<String> = workspaces.into_iter().chain(extra_workspaces).collect();
+    let Some(crates) = get_deps(&all_workspaces, &build_std) else {
         return;
     };
 
@@ -197,7 +223,7 @@ fn get_deps(
 /// See https://doc.rust-lang.org/cargo/reference/registries.html#index-format
 ///
 /// Returns the prefix path component used by both crate storage and index files.
-pub fn get_index_prefix(crate_name: &str) -> Option<PathBuf> {
+pub(crate) fn get_index_prefix(crate_name: &str) -> Option<PathBuf> {
     match crate_name.len() {
         1 => Some(PathBuf::from("1")),
         2 => Some(PathBuf::from("2")),
@@ -223,7 +249,7 @@ pub fn get_index_prefix(crate_name: &str) -> Option<PathBuf> {
 ///   "api": "http://[IP]/crates"
 /// }
 /// ```
-pub fn get_crate_path(
+pub(crate) fn get_crate_path(
     mirror_path: &Path,
     crate_name: &str,
     crate_version: &str,
