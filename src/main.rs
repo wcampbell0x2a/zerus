@@ -190,7 +190,10 @@ pub fn get_crate_path(
 fn download_and_save(mirror_path: &Path, vendors: Vec<(String, Vec<Crate>)>) -> anyhow::Result<()> {
     vendors.into_par_iter().for_each(|(workspace, mut crates)| {
         println!("[-] Vendoring: {workspace}");
-        let client = Client::new();
+        let client = Client::builder()
+            .user_agent(format!("zerus/{} ({})", env!("CARGO_PKG_VERSION"), env!("CARGO_PKG_REPOSITORY")))
+            .build()
+            .unwrap();
         crates.sort();
 
         crates.into_par_iter().for_each(|c| {
