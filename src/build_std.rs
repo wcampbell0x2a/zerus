@@ -1,3 +1,4 @@
+use std::process::Stdio;
 use std::{fs, process::Command};
 
 /// Work around for https://github.com/rust-lang/wg-cargo-std-aware/issues/23
@@ -5,6 +6,7 @@ pub fn prepare_build_std(version: &str) -> Option<String> {
     let sysroot = Command::new("rustc")
         .arg(format!("+{version}"))
         .arg("--print=sysroot")
+        .stderr(Stdio::inherit())
         .output()
         .expect("command failed to start");
 
