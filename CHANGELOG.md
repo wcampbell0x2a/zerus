@@ -5,6 +5,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.13.0] - 05-04-2026
 - Add `update-index` subcommand to generate registry index from `.crate` files
 - Change `mirror` to not grab crates.io git index by default, using `update-index` subcommand is recommended
   - Ensures the git index correctly reflects the partial crates.io mirror
