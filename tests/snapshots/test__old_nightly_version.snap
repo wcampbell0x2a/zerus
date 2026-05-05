@@ -4,6 +4,7 @@ expression: output
 snapshot_kind: text
 ---
 [-] Created <TMP_DIR>
+[-] Running `cargo metadata` for <RUSTUP_HOME>/toolchains/<NIGHTLY_VER>-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/test/Cargo.toml
 [-] Vendoring: <RUSTUP_HOME>/toolchains/<NIGHTLY_VER>-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/test/Cargo.toml
 [-] Downloading: https://static.crates.io/crates/alloc/alloc-0.0.0.crate
 [-] Couldn't download alloc-0.0.0, not hosted on crates.io (this is fine if it's rustc internal library)
