@@ -35,7 +35,7 @@ jobs:
       matrix:
         targets:
           - x86_64-unknown-linux-musl
-       toolchain:
+        toolchain:
           - nightly-2025-10-09
 
 
