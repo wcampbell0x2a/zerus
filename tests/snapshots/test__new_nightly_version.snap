@@ -4,6 +4,7 @@ expression: output
 snapshot_kind: text
 ---
 [-] Created <TMP_DIR>
+[-] Running `cargo metadata` for <RUSTUP_HOME>/toolchains/<NIGHTLY_VER>-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/test/Cargo.toml
 [-] Vendoring: <RUSTUP_HOME>/toolchains/<NIGHTLY_VER>-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/test/Cargo.toml
 [-] Downloading: https://static.crates.io/crates/addr2line/addr2line-0.22.0.crate
 [-] Downloading: https://static.crates.io/crates/adler/adler-1.0.2.crate

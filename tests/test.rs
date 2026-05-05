@@ -1,8 +1,4 @@
-use std::{
-    fs::{File, OpenOptions},
-    io::Write,
-    process::Output,
-};
+use std::{fs::File, io::Write, process::Output};
 
 use assert_cmd::Command;
 use insta::assert_snapshot;
@@ -15,13 +11,13 @@ fn test_old_nightly_version() {
     let mut cmd = Command::new(path);
 
     let tmp_dir = Builder::new().tempdir_in("./").unwrap();
-    let tmp_dir_path = tmp_dir.into_path();
+    let tmp_dir_path = tmp_dir.keep();
     let output = cmd
         .env("RUST_LOG", "none")
         .env("RAYON_NUM_THREADS", "1") // deterministic ordering
         .args([
+            "mirror",
             tmp_dir_path.to_str().unwrap(),
-            "--skip-git-index",
             "--build-std",
             nightly_ver,
         ])
@@ -59,13 +55,13 @@ fn test_new_nightly_version() {
     let mut cmd = Command::new(path);
 
     let tmp_dir = Builder::new().tempdir_in("./").unwrap();
-    let tmp_dir_path = tmp_dir.into_path();
+    let tmp_dir_path = tmp_dir.keep();
     let output = cmd
         .env("RUST_LOG", "none")
         .env("RAYON_NUM_THREADS", "1") // deterministic ordering
         .args([
+            "mirror",
             tmp_dir_path.to_str().unwrap(),
-            "--skip-git-index",
             "--build-std",
             nightly_ver,
         ])
@@ -97,17 +93,16 @@ fn test_new_nightly_version() {
 }
 
 fn test_build_std(nightly_ver: &str, tmp_dir_path: std::path::PathBuf, port: u32) {
-    // run zerus again, but this time add the entire git index
+    // Build our own index from the downloaded .crate files
     let path = assert_cmd::cargo::cargo_bin("zerus");
     let mut cmd = Command::new(path);
     let output = cmd
         .env("RUST_LOG", "none")
         .args([
+            "update-index",
             tmp_dir_path.to_str().unwrap(),
-            "--git-index-url",
+            "--dl-url",
             &format!("http://127.0.0.1:{port}"),
-            "--build-std",
-            nightly_ver,
         ])
         .output()
         .unwrap();
@@ -115,10 +110,10 @@ fn test_build_std(nightly_ver: &str, tmp_dir_path: std::path::PathBuf, port: u32
 
     // Create a temp directory for a cargo project
     let tmp_dir_cargo = Builder::new().tempdir_in("./").unwrap();
-    let tmp_dir_cargo_path = tmp_dir_cargo.into_path();
+    let tmp_dir_cargo_path = tmp_dir_cargo.keep();
 
     // host the crates with a dummy python3 http server
-    let mut server_handle = std::process::Command::new("python3")
+    let _server_handle = std::process::Command::new("python3")
         .args([
             "-m",
             "http.server",

@@ -6,6 +6,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 05-04-2026
+- Add `update-index` subcommand to generate registry index from `.crate` files
+- Change `mirror` to not grab crates.io git index by default, using `update-index` subcommand is recommended
+  - Ensures the git index correctly reflects the partial crates.io mirror
+  - Enables anyone to update and bring their own .crate files, and fix/add to the index on their own
+- Add User-Agent to zerus http usage
+- build-std: Show output of rustup when needed, run `rustup` to get `rust-src` by automatically
+
 ## [0.12.0] - 04-16-2026
 - Enable all features to get all child crates for every feature
 - Limit Fetch depth to 1 for git

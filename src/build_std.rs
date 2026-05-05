@@ -1,3 +1,4 @@
+use std::process::Stdio;
 use std::{fs, process::Command};
 
 /// Work around for https://github.com/rust-lang/wg-cargo-std-aware/issues/23
@@ -5,6 +6,7 @@ pub fn prepare_build_std(version: &str) -> Option<String> {
     let sysroot = Command::new("rustc")
         .arg(format!("+{version}"))
         .arg("--print=sysroot")
+        .stderr(Stdio::inherit())
         .output()
         .expect("command failed to start");
 
@@ -13,10 +15,15 @@ pub fn prepare_build_std(version: &str) -> Option<String> {
 
     let base = format!("{sysroot}/lib/rustlib/src");
     if !fs::exists(&base).unwrap() {
-        println!(
-            "[!] failed to grab sysroot depends, try: `rustup +{version} component add rust-src`"
-        );
-        return None;
+        println!("[!] rust-src not found, running: `rustup +{version} component add rust-src`");
+        let status = Command::new("rustup")
+            .args([&format!("+{version}"), "component", "add", "rust-src"])
+            .status()
+            .expect("failed to run rustup");
+        if !status.success() {
+            println!("[!] failed to install rust-src");
+            return None;
+        }
     }
     // before: https://github.com/rust-lang/rust/commit/1f3be75f56bfa7520b86eada306ad66455b4fd6e
     let old_from = format!("{sysroot}/lib/rustlib/src/rust/Cargo.lock");
