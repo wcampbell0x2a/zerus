@@ -1,9 +1,10 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use flate2::read::GzDecoder;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tar::Archive;
@@ -243,9 +244,11 @@ fn collect_deps(
     }
 }
 
-pub fn write_index_entry(index_path: &Path, entry: &IndexEntry) {
-    let prefix = get_index_prefix(&entry.name).expect("invalid crate name for index prefix");
-    let index_file = index_path.join(prefix).join(&entry.name);
+pub fn write_index_entries(index_path: &Path, new_entries: &[IndexEntry]) {
+    println!("[-] Writing: {}", index_path.display());
+    let first = &new_entries[0];
+    let prefix = get_index_prefix(&first.name).expect("invalid crate name for index prefix");
+    let index_file = index_path.join(prefix).join(&first.name);
 
     let mut entries: Vec<IndexEntry> = if index_file.exists() {
         let contents = fs::read_to_string(&index_file).expect("failed to read index file");
@@ -258,19 +261,23 @@ pub fn write_index_entry(index_path: &Path, entry: &IndexEntry) {
         Vec::new()
     };
 
-    if let Some(pos) = entries.iter().position(|e| e.vers == entry.vers) {
-        entries.remove(pos);
+    for new in new_entries {
+        entries.retain(|e| e.vers != new.vers);
     }
 
     fs::create_dir_all(index_file.parent().unwrap()).expect("failed to create index directory");
 
-    let mut lines: Vec<String> = entries
+    let lines: Vec<String> = entries
         .iter()
+        .chain(new_entries.iter())
         .map(|e| serde_json::to_string(e).expect("failed to serialize index entry"))
         .collect();
-    lines.push(serde_json::to_string(entry).expect("failed to serialize index entry"));
 
-    let content = lines.join("\n") + "\n";
+    let content = if lines.is_empty() {
+        String::new()
+    } else {
+        lines.join("\n") + "\n"
+    };
     fs::write(&index_file, content).expect("failed to write index file");
 }
 
@@ -280,12 +287,26 @@ pub fn update_index(index_path: &Path, crates_path: &Path, dl_url: Option<&str>)
     let crate_files = find_crate_files(crates_path);
     println!("[-] Found {} .crate files", crate_files.len());
 
-    for crate_file in &crate_files {
-        println!("[-] Processing: {}", crate_file.display());
-        let cksum = compute_cksum(crate_file);
-        let manifest = extract_cargo_toml(crate_file);
-        let entry = manifest_to_index_entry(&manifest, cksum);
-        write_index_entry(index_path, &entry);
+    // In parallel, find all crate files and compute info
+    let entries: Vec<IndexEntry> = crate_files
+        .par_iter()
+        .map(|crate_file| {
+            println!("[-] Processing: {}", crate_file.display());
+            let cksum = compute_cksum(crate_file);
+            let manifest = extract_cargo_toml(crate_file);
+            manifest_to_index_entry(&manifest, cksum)
+        })
+        .collect();
+
+    // Sort by crate name
+    let mut grouped: HashMap<String, Vec<IndexEntry>> = HashMap::new();
+    for entry in entries {
+        grouped.entry(entry.name.clone()).or_default().push(entry);
+    }
+
+    // Write all index entries
+    for (_name, entries) in &grouped {
+        write_index_entries(index_path, entries);
     }
 
     if let Some(url) = dl_url {
