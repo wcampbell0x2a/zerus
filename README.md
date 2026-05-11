@@ -24,6 +24,16 @@ Use `zerus mirror` to download `.crate` files for your project's dependencies.
 $ zerus mirror new-mirror ../deku/Cargo.toml ../adsb_deku/Cargo.toml
 ```
 
+Mirror individual crates by name (resolves to the latest version) or pinned to a specific version. When `--crate` is used, `--get-feature-gated` is implied.
+```console
+$ zerus mirror new-mirror --crate reqwest --crate serde@1.0.210
+```
+
+Use `--get-feature-gated` to recursively expand and download all transitive dependencies, regardless of which features are currently enabled. This is useful when building a more complete mirror rather than one tailored to a specific project's current feature set — ensuring crates are available even if features change later.
+```console
+$ zerus mirror new-mirror --get-feature-gated ../deku/Cargo.toml
+```
+
 Adding the top 100 rust crates used by rust-playground is easy:
 ```console
 $ git clone https://github.com/rust-lang/rust-playground

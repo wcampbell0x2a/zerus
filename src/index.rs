@@ -3,6 +3,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use anyhow::{bail, Context};
 use flate2::read::GzDecoder;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -123,23 +124,28 @@ fn find_crate_files_recursive(dir: &Path, result: &mut Vec<PathBuf>) {
     }
 }
 
-pub fn compute_cksum(path: &Path) -> String {
-    let data = fs::read(path).expect("failed to read .crate file");
+pub fn compute_cksum(path: &Path) -> anyhow::Result<String> {
+    let data = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     let mut hasher = Sha256::new();
     hasher.update(&data);
-    format!("{:x}", hasher.finalize())
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
-pub fn extract_cargo_toml(path: &Path) -> CrateManifest {
-    let file = fs::File::open(path).expect("failed to open .crate file");
+pub fn extract_cargo_toml(path: &Path) -> anyhow::Result<CrateManifest> {
+    let file =
+        fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     let decoder = GzDecoder::new(file);
     let mut archive = Archive::new(decoder);
 
-    for entry in archive.entries().expect("failed to read tar entries") {
-        let mut entry = entry.expect("failed to read tar entry");
+    for entry in archive
+        .entries()
+        .with_context(|| format!("failed to read tar entries from {}", path.display()))?
+    {
+        let mut entry =
+            entry.with_context(|| format!("failed to read tar entry from {}", path.display()))?;
         let entry_path = entry
             .path()
-            .expect("failed to read entry path")
+            .with_context(|| format!("failed to read entry path from {}", path.display()))?
             .into_owned();
         // Cargo.toml is at {name}-{version}/Cargo.toml
         if entry_path.file_name().is_some_and(|f| f == "Cargo.toml")
@@ -148,14 +154,13 @@ pub fn extract_cargo_toml(path: &Path) -> CrateManifest {
             let mut contents = String::new();
             entry
                 .read_to_string(&mut contents)
-                .expect("failed to read Cargo.toml from archive");
-            return toml::from_str(&contents).unwrap_or_else(|e| {
-                panic!("failed to parse Cargo.toml from {}: {e}", path.display())
-            });
+                .with_context(|| format!("failed to read Cargo.toml from {}", path.display()))?;
+            return toml::from_str(&contents)
+                .with_context(|| format!("failed to parse Cargo.toml from {}", path.display()));
         }
     }
 
-    panic!("Cargo.toml not found in {}", path.display());
+    bail!("Cargo.toml not found in {}", path.display())
 }
 
 pub fn manifest_to_index_entry(manifest: &CrateManifest, cksum: String) -> IndexEntry {
@@ -244,19 +249,25 @@ fn collect_deps(
     }
 }
 
-pub fn write_index_entries(index_path: &Path, new_entries: &[IndexEntry]) {
-    println!("[-] Writing: {}", index_path.display());
+pub fn write_index_entries(index_path: &Path, new_entries: &[IndexEntry]) -> anyhow::Result<()> {
     let first = &new_entries[0];
-    let prefix = get_index_prefix(&first.name).expect("invalid crate name for index prefix");
+    let prefix = get_index_prefix(&first.name).context("invalid crate name for index prefix")?;
     let index_file = index_path.join(prefix).join(&first.name);
 
     let mut entries: Vec<IndexEntry> = if index_file.exists() {
-        let contents = fs::read_to_string(&index_file).expect("failed to read index file");
+        let contents = fs::read_to_string(&index_file)
+            .with_context(|| format!("failed to read {}", index_file.display()))?;
         contents
             .lines()
             .filter(|l| !l.is_empty())
-            .map(|l| serde_json::from_str(l).expect("failed to parse existing index entry"))
-            .collect()
+            .map(|l| serde_json::from_str(l))
+            .collect::<Result<Vec<_>, _>>()
+            .with_context(|| {
+                format!(
+                    "failed to parse existing index entry in {}",
+                    index_file.display()
+                )
+            })?
     } else {
         Vec::new()
     };
@@ -265,24 +276,35 @@ pub fn write_index_entries(index_path: &Path, new_entries: &[IndexEntry]) {
         entries.retain(|e| e.vers != new.vers);
     }
 
-    fs::create_dir_all(index_file.parent().unwrap()).expect("failed to create index directory");
+    if let Some(parent) = index_file.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create index directory {}", parent.display()))?;
+    }
 
     let lines: Vec<String> = entries
         .iter()
         .chain(new_entries.iter())
-        .map(|e| serde_json::to_string(e).expect("failed to serialize index entry"))
-        .collect();
+        .map(|e| serde_json::to_string(e))
+        .collect::<Result<Vec<_>, _>>()
+        .context("failed to serialize index entry")?;
 
     let content = if lines.is_empty() {
         String::new()
     } else {
         lines.join("\n") + "\n"
     };
-    fs::write(&index_file, content).expect("failed to write index file");
+    fs::write(&index_file, content)
+        .with_context(|| format!("failed to write {}", index_file.display()))?;
+
+    Ok(())
 }
 
-pub fn update_index(index_path: &Path, crates_path: &Path, dl_url: Option<&str>) {
-    fs::create_dir_all(index_path).expect("failed to create index directory");
+pub fn update_index(
+    index_path: &Path,
+    crates_path: &Path,
+    dl_url: Option<&str>,
+) -> anyhow::Result<()> {
+    fs::create_dir_all(index_path).context("failed to create index directory")?;
 
     let crate_files = find_crate_files(crates_path);
     println!("[-] Found {} .crate files", crate_files.len());
@@ -292,11 +314,11 @@ pub fn update_index(index_path: &Path, crates_path: &Path, dl_url: Option<&str>)
         .par_iter()
         .map(|crate_file| {
             println!("[-] Processing: {}", crate_file.display());
-            let cksum = compute_cksum(crate_file);
-            let manifest = extract_cargo_toml(crate_file);
-            manifest_to_index_entry(&manifest, cksum)
+            let cksum = compute_cksum(crate_file)?;
+            let manifest = extract_cargo_toml(crate_file)?;
+            Ok(manifest_to_index_entry(&manifest, cksum))
         })
-        .collect();
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
     // Sort by crate name
     let mut grouped: HashMap<String, Vec<IndexEntry>> = HashMap::new();
@@ -306,7 +328,7 @@ pub fn update_index(index_path: &Path, crates_path: &Path, dl_url: Option<&str>)
 
     // Write all index entries
     for (_name, entries) in &grouped {
-        write_index_entries(index_path, entries);
+        write_index_entries(index_path, entries)?;
     }
 
     if let Some(url) = dl_url {
@@ -315,12 +337,14 @@ pub fn update_index(index_path: &Path, crates_path: &Path, dl_url: Option<&str>)
             .write(true)
             .create(true)
             .truncate(true)
-            .open(config_path)
-            .expect("failed to create config.json");
-        crate::git::write_config_json(url, file).expect("failed to write config.json");
+            .open(&config_path)
+            .with_context(|| format!("failed to create {}", config_path.display()))?;
+        crate::git::write_config_json(url, file).context("failed to write config.json")?;
     } else if !index_path.join("config.json").exists() {
         eprintln!("[WARN] No config.json found in index and --dl-url not provided. The index will be unusable without it.");
     }
 
     println!("[-] Index updated at {}", index_path.display());
+
+    Ok(())
 }
