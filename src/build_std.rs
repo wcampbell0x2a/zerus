@@ -8,29 +8,29 @@ pub fn prepare_build_std(version: &str) -> Option<String> {
         .arg("--print=sysroot")
         .stderr(Stdio::inherit())
         .output()
-        .expect("command failed to start");
+        .ok()?;
 
-    let mut sysroot = std::str::from_utf8(&sysroot.stdout).unwrap().to_string();
+    let mut sysroot = std::str::from_utf8(&sysroot.stdout).ok()?.to_string();
     sysroot.pop();
 
     let base = format!("{sysroot}/lib/rustlib/src");
-    if !fs::exists(&base).unwrap() {
+    if !fs::exists(&base).unwrap_or(false) {
         println!("[!] rust-src not found, running: `rustup +{version} component add rust-src`");
         let status = Command::new("rustup")
             .args([&format!("+{version}"), "component", "add", "rust-src"])
             .status()
-            .expect("failed to run rustup");
+            .ok()?;
         if !status.success() {
             println!("[!] failed to install rust-src");
             return None;
         }
     }
-    // before: https://github.com/rust-lang/rust/commit/1f3be75f56bfa7520b86eada306ad66455b4fd6e
+    // before: https://github.com/rust-lang/rust/commit/1f3be75f56bfa7520b86eada306ad66455b4fd6e
     let old_from = format!("{sysroot}/lib/rustlib/src/rust/Cargo.lock");
     let from = format!("{sysroot}/lib/rustlib/src/rust/library/Cargo.lock");
-    let from = if fs::exists(&old_from).unwrap() {
+    let from = if fs::exists(&old_from).unwrap_or(false) {
         Some(old_from)
-    } else if fs::exists(&from).unwrap() {
+    } else if fs::exists(&from).unwrap_or(false) {
         Some(from)
     } else {
         None

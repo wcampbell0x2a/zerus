@@ -14,7 +14,9 @@ struct State {
 }
 
 fn print(state: &mut State) {
-    let stats = state.progress.as_ref().unwrap();
+    let Some(stats) = state.progress.as_ref() else {
+        return;
+    };
     let network_pct = (100 * stats.received_objects()) / stats.total_objects();
     let index_pct = (100 * stats.indexed_objects()) / stats.total_objects();
     let co_pct = (100 * state.current).checked_div(state.total).unwrap_or(0);
@@ -50,7 +52,7 @@ fn print(state: &mut State) {
                 .unwrap_or_default()
         )
     }
-    std::io::stdout().flush().unwrap();
+    let _ = std::io::stdout().flush();
 }
 
 pub fn clone(repo_path: &Path) -> Result<(), git2::Error> {
@@ -101,8 +103,8 @@ pub fn pull(repo: &Path) -> Result<(), git2::Error> {
         .find_remote(remote)
         .or_else(|_| repo.remote_anonymous(remote))?;
     cb.sideband_progress(|data| {
-        print!("remote: {}", std::str::from_utf8(data).unwrap());
-        std::io::stdout().flush().unwrap();
+        print!("remote: {}", String::from_utf8_lossy(data));
+        let _ = std::io::stdout().flush();
         true
     });
 
@@ -137,7 +139,7 @@ pub fn pull(repo: &Path) -> Result<(), git2::Error> {
                 stats.received_bytes()
             );
         }
-        std::io::stdout().flush().unwrap();
+        let _ = std::io::stdout().flush();
         true
     });
 
