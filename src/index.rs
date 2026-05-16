@@ -62,6 +62,8 @@ pub struct PackageInfo {
     pub name: String,
     pub version: String,
     #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
     pub links: Option<String>,
 }
 

@@ -50,7 +50,15 @@ $ zerus update-index new-mirror --dl-url http://[IP]
 ```
 
 ### Serve mirror
-Use any `http(s)` server to host the mirror directory.
+Use `zerus serve` to host the registry with sparse index, crate downloads, and a search API.
+```console
+$ zerus serve new-mirror --bind 0.0.0.0:8080
+```
+
+Enable request logging with:
+```console
+$ RUST_LOG=tower_http=debug zerus serve new-mirror
+```
 
 ### Build with mirror
 Add the following to `.cargo/config.toml` (replacing `[IP]` with your server address).

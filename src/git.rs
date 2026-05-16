@@ -239,7 +239,7 @@ pub fn write_config_json(url: &str, mut writer: impl Write) -> std::io::Result<(
     let f = format!(
         r#"{{
   "dl": "{url}/crates/{{prefix}}/{{crate}}/{{version}}/{{crate}}-{{version}}.crate",
-  "api": "{url}/crates"
+  "api": "{url}"
 }}
 "#
     );

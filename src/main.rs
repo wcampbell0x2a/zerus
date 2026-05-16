@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand, ValueHint};
 mod git;
 mod index;
 mod mirror;
+mod serve;
 
 fn validate_url(url: &str) -> Result<String, String> {
     if url.starts_with("http://") || url.starts_with("https://") {
@@ -77,9 +78,22 @@ enum Command {
         #[arg(value_hint = ValueHint::Url, value_parser = validate_url)]
         dl_url: Option<String>,
     },
+    /// Serve crate registry with sparse index, downloads, and search
+    Serve {
+        /// Path to mirror directory
+        mirror_path: PathBuf,
+
+        /// Address to bind to
+        #[arg(long, default_value = "0.0.0.0:8080")]
+        bind: String,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
     let args = Args::parse();
 
     match args.command {
@@ -112,6 +126,9 @@ fn main() -> anyhow::Result<()> {
             let index_path = mirror_path.join("crates.io-index");
             let crates_path = mirror_path.join("crates");
             index::update_index(&index_path, &crates_path, dl_url.as_deref())?;
+        }
+        Command::Serve { mirror_path, bind } => {
+            serve::serve(mirror_path, bind)?;
         }
     }
 
