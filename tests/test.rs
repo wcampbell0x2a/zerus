@@ -16,6 +16,7 @@ fn test_old_nightly_version() {
         .env("RUST_LOG", "none")
         .env("RAYON_NUM_THREADS", "1") // deterministic ordering
         .args([
+            "--verbose",
             "mirror",
             tmp_dir_path.to_str().unwrap(),
             "--build-std",
@@ -60,6 +61,7 @@ fn test_new_nightly_version() {
         .env("RUST_LOG", "none")
         .env("RAYON_NUM_THREADS", "1") // deterministic ordering
         .args([
+            "--verbose",
             "mirror",
             tmp_dir_path.to_str().unwrap(),
             "--build-std",
@@ -103,6 +105,7 @@ fn test_get_feature_gated() {
         .env("RUST_LOG", "none")
         .env("RAYON_NUM_THREADS", "1") // deterministic ordering
         .args([
+            "--verbose",
             "mirror",
             tmp_dir_path.to_str().unwrap(),
             "--crate",

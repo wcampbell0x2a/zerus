@@ -34,6 +34,10 @@ impl Crate {
 struct Args {
     #[command(subcommand)]
     command: Command,
+
+    /// Print each download/processing line instead of progress bars
+    #[arg(short, long, global = true)]
+    verbose: bool,
 }
 
 #[derive(Subcommand)]
@@ -117,6 +121,7 @@ fn main() -> anyhow::Result<()> {
                 git_index_url,
                 git_index,
                 get_feature_gated,
+                args.verbose,
             )?;
         }
         Command::UpdateIndex {
@@ -125,7 +130,7 @@ fn main() -> anyhow::Result<()> {
         } => {
             let index_path = mirror_path.join("crates.io-index");
             let crates_path = mirror_path.join("crates");
-            index::update_index(&index_path, &crates_path, dl_url.as_deref())?;
+            index::update_index(&index_path, &crates_path, dl_url.as_deref(), args.verbose)?;
         }
         Command::Serve { mirror_path, bind } => {
             serve::serve(mirror_path, bind)?;

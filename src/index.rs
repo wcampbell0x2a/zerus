@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use flate2::read::GzDecoder;
+use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -305,22 +306,39 @@ pub fn update_index(
     index_path: &Path,
     crates_path: &Path,
     dl_url: Option<&str>,
+    verbose: bool,
 ) -> anyhow::Result<()> {
     fs::create_dir_all(index_path).context("failed to create index directory")?;
 
     let crate_files = find_crate_files(crates_path);
     println!("[-] Found {} .crate files", crate_files.len());
 
+    let pb = ProgressBar::new(crate_files.len() as u64);
+    if verbose {
+        pb.set_draw_target(indicatif::ProgressDrawTarget::hidden());
+    } else {
+        pb.set_style(
+            ProgressStyle::with_template("[{bar:40}] {pos}/{len} indexing crates")
+                .unwrap()
+                .progress_chars("=> "),
+        );
+    }
+
     // In parallel, find all crate files and compute info
     let entries: Vec<IndexEntry> = crate_files
         .par_iter()
         .map(|crate_file| {
-            println!("[-] Processing: {}", crate_file.display());
+            if verbose {
+                println!("[-] Processing: {}", crate_file.display());
+            }
             let cksum = compute_cksum(crate_file)?;
             let manifest = extract_cargo_toml(crate_file)?;
+            pb.inc(1);
             Ok(manifest_to_index_entry(&manifest, cksum))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
+
+    pb.finish_and_clear();
 
     // Sort by crate name
     let mut grouped: HashMap<String, Vec<IndexEntry>> = HashMap::new();
