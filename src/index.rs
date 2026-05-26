@@ -361,7 +361,9 @@ pub fn update_index(
             .with_context(|| format!("failed to create {}", config_path.display()))?;
         crate::git::write_config_json(url, file).context("failed to write config.json")?;
     } else if !index_path.join("config.json").exists() {
-        eprintln!("[WARN] No config.json found in index and --dl-url not provided. The index will be unusable without it.");
+        eprintln!(
+            "[WARN] No config.json found in index and --dl-url not provided. The index will be unusable without it."
+        );
     }
 
     println!("[-] Index updated at {}", index_path.display());

@@ -5,12 +5,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, bail};
-use reqwest::Client;
 use guppy::MetadataCommand;
 use guppy::errors::Error::CommandError;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
-use reqwest::blocking::Client;
 use reqwest::StatusCode;
 use semver::{Version, VersionReq};
 use serde::Deserialize;
