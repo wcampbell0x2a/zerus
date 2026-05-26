@@ -5,6 +5,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.14.0] - 05-25-2026
 - Add `serve` subcommand for serving crate registry with sparse index, downloads, and search support.
 - Add `--crate` option to mirror specific crates without a `Cargo.toml` (e.g. `--crate reqwest@0.12.8`)
 - Add `--get-feature-gated` to extract and grab all depends for each crate, ignoring enabled features.

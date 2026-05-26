@@ -6,7 +6,7 @@ zerus
 [<img alt="docs.rs" src="https://img.shields.io/badge/docs.rs-zerus-66c2a5?style=for-the-badge&labelColor=555555&logo=docs.rs" height="20">](https://docs.rs/zerus)
 [<img alt="build status" src="https://img.shields.io/github/actions/workflow/status/wcampbell0x2a/zerus/main.yml?branch=master&style=for-the-badge" height="20">](https://github.com/wcampbell0x2a/zerus/actions?query=branch%3Amaster)
 
-Lightweight tool for creating project-specific offline crates.io mirrors
+Lightweight tool for creating project-specific and/or general offline crates.io mirrors
 
 ## Build zerus
 Either build from published source in crates.io.
@@ -68,4 +68,12 @@ registry = "sparse+http://[IP]/crates.io-index/"
 
 [source.crates-io]
 replace-with = "zerus"
+
+[registries.zerus]
+index = "sparse+http://[IP]/crates.io-index/"
+```
+
+With the `registries` entry, you can search the mirror:
+```console
+$ cargo search --registry zerus serde
 ```
