@@ -2,16 +2,16 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
+use axum::Json;
 use serde::Serialize;
 use tower_http::trace::TraceLayer;
 
 use crate::get_crate_path;
-use crate::index::{IndexEntry, extract_cargo_toml};
+use crate::index::{extract_cargo_toml, IndexEntry};
 
 struct AppState {
     mirror_path: PathBuf,

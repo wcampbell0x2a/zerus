@@ -3,7 +3,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, bail};
+use anyhow::{bail, Context};
 use flate2::read::GzDecoder;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;

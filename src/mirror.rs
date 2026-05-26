@@ -4,9 +4,9 @@ use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use anyhow::{Context, bail};
-use guppy::MetadataCommand;
+use anyhow::{bail, Context};
 use guppy::errors::Error::CommandError;
+use guppy::MetadataCommand;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use reqwest::StatusCode;
@@ -15,8 +15,8 @@ use serde::Deserialize;
 
 use crate::build_std::prepare_build_std;
 use crate::git::{clone, pull, write_config_json};
-use crate::index::{CrateManifest, DependencySpec, extract_cargo_toml, find_crate_files};
-use crate::{Crate, get_crate_path};
+use crate::index::{extract_cargo_toml, find_crate_files, CrateManifest, DependencySpec};
+use crate::{get_crate_path, Crate};
 
 /// Download all crate files and put into spots that are expected by cargo from crates.io
 fn download_and_save(
@@ -333,7 +333,11 @@ fn expand_deps(mirror_path: &Path, verbose: bool) -> anyhow::Result<()> {
 
         // Resolve versions and download in parallel
         let new_downloads = AtomicUsize::new(0);
-        let mp = if verbose { None } else { Some(MultiProgress::new()) };
+        let mp = if verbose {
+            None
+        } else {
+            Some(MultiProgress::new())
+        };
         let pb = mp.as_ref().map(|mp| {
             let pb = mp.add(ProgressBar::new(missing.len() as u64));
             pb.set_style(
@@ -345,16 +349,22 @@ fn expand_deps(mirror_path: &Path, verbose: bool) -> anyhow::Result<()> {
         });
 
         missing.par_iter().for_each(|(name, req)| {
-            let dl_pb = mp.as_ref().and_then(|mp| pb.as_ref().map(|pb| {
-                let dl_pb = mp.insert_before(pb, ProgressBar::new_spinner());
-                dl_pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
-                dl_pb.set_message(name.clone());
-                dl_pb
-            }));
+            let dl_pb = mp.as_ref().and_then(|mp| {
+                pb.as_ref().map(|pb| {
+                    let dl_pb = mp.insert_before(pb, ProgressBar::new_spinner());
+                    dl_pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
+                    dl_pb.set_message(name.clone());
+                    dl_pb
+                })
+            });
 
             let done = |dl_pb: Option<ProgressBar>| {
-                if let (Some(mp), Some(dl_pb)) = (&mp, dl_pb) { mp.remove(&dl_pb); }
-                if let Some(pb) = &pb { pb.inc(1); }
+                if let (Some(mp), Some(dl_pb)) = (&mp, dl_pb) {
+                    mp.remove(&dl_pb);
+                }
+                if let Some(pb) = &pb {
+                    pb.inc(1);
+                }
             };
 
             let Some(resolved_version) = resolve_version(&client, name, req) else {
@@ -380,7 +390,9 @@ fn expand_deps(mirror_path: &Path, verbose: bool) -> anyhow::Result<()> {
 
             let url =
                 format!("https://static.crates.io/crates/{name}/{name}-{resolved_version}.crate");
-            if let Some(dl_pb) = &dl_pb { dl_pb.set_message(format!("{name}-{resolved_version}")); }
+            if let Some(dl_pb) = &dl_pb {
+                dl_pb.set_message(format!("{name}-{resolved_version}"));
+            }
             if verbose {
                 println!("[-] [expand pass {pass}] Downloading: {url}");
             }
@@ -419,7 +431,9 @@ fn expand_deps(mirror_path: &Path, verbose: bool) -> anyhow::Result<()> {
         });
 
         let count = new_downloads.load(Ordering::Relaxed);
-        if let Some(pb) = &pb { pb.finish_with_message(format!("pass {pass}: downloaded {count} new crate(s)")); }
+        if let Some(pb) = &pb {
+            pb.finish_with_message(format!("pass {pass}: downloaded {count} new crate(s)"));
+        }
         println!("[-] [expand pass {pass}] Downloaded {count} new crate(s)");
 
         if count == 0 {
