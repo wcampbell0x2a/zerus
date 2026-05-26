@@ -103,7 +103,6 @@ fn test_get_feature_gated() {
     let tmp_dir_path = tmp_dir.keep();
     let output = cmd
         .env("RUST_LOG", "none")
-        .env("RAYON_NUM_THREADS", "1") // deterministic ordering
         .args([
             "--verbose",
             "mirror",
