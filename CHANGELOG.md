@@ -6,6 +6,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 05-25-2026
+- Add `serve` subcommand for serving crate registry with sparse index, downloads, and search support.
+- Add `--crate` option to mirror specific crates without a `Cargo.toml` (e.g. `--crate reqwest@0.12.8`)
+- Add `--get-feature-gated` to extract and grab all depends for each crate, ignoring enabled features.
+  This is enabled by default for `-crate`.
+- Add progress bars for downloads and processing, with `--verbose` flag for line-by-line output
+- Compute subcommand `update-index` crates in parallel
+
 ## [0.13.0] - 05-04-2026
 - Add `update-index` subcommand to generate registry index from `.crate` files
 - Change `mirror` to not grab crates.io git index by default, using `update-index` subcommand is recommended

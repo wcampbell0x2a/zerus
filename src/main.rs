@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand, ValueHint};
 mod git;
 mod index;
 mod mirror;
+mod serve;
 
 fn validate_url(url: &str) -> Result<String, String> {
     if url.starts_with("http://") || url.starts_with("https://") {
@@ -33,6 +34,10 @@ impl Crate {
 struct Args {
     #[command(subcommand)]
     command: Command,
+
+    /// Print each download/processing line instead of progress bars
+    #[arg(short, long, global = true)]
+    verbose: bool,
 }
 
 #[derive(Subcommand)]
@@ -44,6 +49,10 @@ enum Command {
 
         /// list of Cargo.toml files to vendor depends
         workspaces: Vec<String>,
+
+        /// Crates to mirror (format: name@version or name for latest, e.g. reqwest@0.12.8 or reqwest)
+        #[arg(long = "crate", value_name = "NAME[@VERSION]")]
+        extra_crates: Vec<String>,
 
         /// Cache build-std depends for nightly toolchain (e.g. nightly-2024-10-09)
         #[arg(long, value_name = "VERSION")]
@@ -58,6 +67,10 @@ enum Command {
         /// Download git index crates.io
         #[arg(long)]
         git_index: bool,
+
+        /// For each depends, extract and grab all depends. This ignores enabled features.
+        #[arg(long)]
+        get_feature_gated: bool,
     },
     /// Generate a limited crates git index from .crate files
     UpdateIndex {
@@ -69,20 +82,47 @@ enum Command {
         #[arg(value_hint = ValueHint::Url, value_parser = validate_url)]
         dl_url: Option<String>,
     },
+    /// Serve crate registry with sparse index, downloads, and search
+    Serve {
+        /// Path to mirror directory
+        mirror_path: PathBuf,
+
+        /// Address to bind to
+        #[arg(long, default_value = "0.0.0.0:8080")]
+        bind: String,
+    },
 }
 
-fn main() {
+fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+
     let args = Args::parse();
 
     match args.command {
         Command::Mirror {
             mirror_path,
             workspaces,
+            extra_crates,
             build_std,
             git_index_url,
             git_index,
+            get_feature_gated,
         } => {
-            mirror::mirror(mirror_path, workspaces, build_std, git_index_url, git_index);
+            if workspaces.is_empty() && extra_crates.is_empty() && build_std.is_none() {
+                anyhow::bail!("provide at least one workspace, --crate, or --build-std");
+            }
+            mirror::mirror(
+                mirror_path,
+                workspaces,
+                extra_crates,
+                build_std,
+                git_index_url,
+                git_index,
+                get_feature_gated,
+                args.verbose,
+            )?;
         }
         Command::UpdateIndex {
             mirror_path,
@@ -90,9 +130,14 @@ fn main() {
         } => {
             let index_path = mirror_path.join("crates.io-index");
             let crates_path = mirror_path.join("crates");
-            index::update_index(&index_path, &crates_path, dl_url.as_deref());
+            index::update_index(&index_path, &crates_path, dl_url.as_deref(), args.verbose)?;
+        }
+        Command::Serve { mirror_path, bind } => {
+            serve::serve(mirror_path, bind)?;
         }
     }
+
+    Ok(())
 }
 
 /// See https://doc.rust-lang.org/cargo/reference/registries.html#index-format

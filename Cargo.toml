@@ -1,9 +1,9 @@
 [package]
 name = "zerus"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2021"
 authors = ["wcampbell"]
-description = "Lightweight tool for creating project-specific offline crates.io mirrors"
+description = "Lightweight tool for creating project-specific and/or general offline crates.io mirrors"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 homepage = "https://github.com/wcampbell0x2a/zerus"
@@ -24,6 +24,14 @@ sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+semver = "1"
+axum = "0.8"
+indicatif = "0.17"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tower-http = { version = "0.6", features = ["trace"] }
+
 
 [dev-dependencies]
 assert_cmd = { version = "2.0.16", features = ["color", "color-auto"] }

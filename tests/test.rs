@@ -16,6 +16,7 @@ fn test_old_nightly_version() {
         .env("RUST_LOG", "none")
         .env("RAYON_NUM_THREADS", "1") // deterministic ordering
         .args([
+            "--verbose",
             "mirror",
             tmp_dir_path.to_str().unwrap(),
             "--build-std",
@@ -60,6 +61,7 @@ fn test_new_nightly_version() {
         .env("RUST_LOG", "none")
         .env("RAYON_NUM_THREADS", "1") // deterministic ordering
         .args([
+            "--verbose",
             "mirror",
             tmp_dir_path.to_str().unwrap(),
             "--build-std",
@@ -90,6 +92,28 @@ fn test_new_nightly_version() {
     assert_snapshot!(output);
 
     test_build_std(nightly_ver, tmp_dir_path.to_path_buf(), 8080);
+}
+
+#[test]
+fn test_get_feature_gated() {
+    let path = assert_cmd::cargo::cargo_bin("zerus");
+    let mut cmd = Command::new(path);
+
+    let tmp_dir = Builder::new().tempdir_in("./").unwrap();
+    let tmp_dir_path = tmp_dir.keep();
+    let output = cmd
+        .env("RUST_LOG", "none")
+        .args([
+            "--verbose",
+            "mirror",
+            tmp_dir_path.to_str().unwrap(),
+            "--crate",
+            "deku@0.20.3",
+            "--get-feature-gated",
+        ])
+        .output()
+        .unwrap();
+    assert_success(&output);
 }
 
 fn test_build_std(nightly_ver: &str, tmp_dir_path: std::path::PathBuf, port: u32) {
