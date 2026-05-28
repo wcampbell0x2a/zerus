@@ -47,7 +47,7 @@ jobs:
           target: x86_64-unknown-linux-musl, x86_64-unknown-linux-gnu
       - uses: actions/setup-python@v6
         with:
-          python-version: '3.12' 
+          python-version: '3.14' 
       - run: python3 -m http.server -h
       - run: cargo install cross --git https://github.com/cross-rs/cross --force
       - run: echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> $GITHUB_PATH
