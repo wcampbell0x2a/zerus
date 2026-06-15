@@ -41,7 +41,7 @@ struct Args {
     #[command(subcommand)]
     command: Command,
 
-    /// Print each download/processing line instead of progress bars
+    /// Show the full log of every download/processing line (debug level)
     #[arg(short, long, global = true)]
     verbose: bool,
 }
@@ -56,7 +56,9 @@ enum Command {
         /// list of Cargo.toml files to vendor depends
         workspaces: Vec<String>,
 
-        /// Crates to mirror (format: name@version or name for latest, e.g. reqwest@0.12.8 or reqwest)
+        /// Crates to mirror (format: name@version or name for latest, e.g. reqwest@0.12.8 or reqwest).
+        /// Implies --get-feature-gated: downloads the full recursive dependency closure
+        /// (including dev/build deps, ignoring features), which can be thousands of crates
         #[arg(long = "crate", value_name = "NAME[@VERSION]")]
         extra_crates: Vec<String>,
 
@@ -74,7 +76,9 @@ enum Command {
         #[arg(long)]
         git_index: bool,
 
-        /// For each depends, extract and grab all depends. This ignores enabled features.
+        /// For each depends, extract and grab all depends. This ignores enabled features
+        /// and includes dev/build dependencies, so even a small crate can expand the
+        /// mirror to thousands of crates
         #[arg(long)]
         get_feature_gated: bool,
     },

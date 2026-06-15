@@ -30,6 +30,9 @@ $ zerus mirror new-mirror --crate reqwest --crate serde@1.0.210
 ```
 
 Use `--get-feature-gated` to recursively expand and download all transitive dependencies, regardless of which features are currently enabled. This is useful when building a more complete mirror rather than one tailored to a specific project's current feature set — ensuring crates are available even if features change later.
+
+> [!NOTE]
+> The expansion (run by `--get-feature-gated` and implied by `--crate`) includes dev and build dependencies of every crate it visits and ignores feature gating, so the result is far larger than what `cargo metadata` would resolve — even a tiny crate like `cfg-if` expands to thousands of crates. To mirror only a project's resolved dependencies, pass its `Cargo.toml` instead of using `--crate`.
 ```console
 $ zerus mirror new-mirror --get-feature-gated ../deku/Cargo.toml
 ```
