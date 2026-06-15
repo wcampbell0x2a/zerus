@@ -7,53 +7,86 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use anyhow::{bail, Context};
 use guppy::errors::Error::CommandError;
 use guppy::MetadataCommand;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::ProgressStyle;
 use rayon::prelude::*;
 use reqwest::StatusCode;
 use semver::{Version, VersionReq};
 use serde::Deserialize;
+use tracing::{debug, info, info_span, warn};
+use tracing_indicatif::span_ext::IndicatifSpanExt;
 
 use crate::build_std::prepare_build_std;
 use crate::git::{clone, pull, write_config_json};
 use crate::index::{extract_cargo_toml, find_crate_files, CrateManifest, DependencySpec};
 use crate::{get_crate_path, Crate};
 
+/// Template for the overall counter bar shared across phases.
+fn counter_style(label: &str) -> ProgressStyle {
+    ProgressStyle::with_template(&format!("[{{bar:40}}] {{pos}}/{{len}} {label}"))
+        .unwrap()
+        .progress_chars("=> ")
+}
+
+/// Outcome of fetching a .crate file.
+enum Download {
+    /// HTTP 200; the crate bytes.
+    Ok(Vec<u8>),
+    /// A non-200 response (e.g. 404). Carries the status for the caller to report.
+    NotFound(StatusCode),
+}
+
+/// Download a .crate file, retrying transient transport failures (the request
+/// never reaching a response, or the body failing mid-stream) a few times with
+/// a short backoff. A non-200 response is not retried — it's returned as
+/// `NotFound` for the caller to handle. Returns `Err` only after exhausting
+/// retries.
+fn download_crate(
+    client: &reqwest::blocking::Client,
+    url: &str,
+) -> anyhow::Result<Download> {
+    const ATTEMPTS: u32 = 3;
+    let mut last_err = None;
+    for attempt in 0..ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(200 * (1 << (attempt - 1))));
+        }
+        let response = match client.get(url).send() {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(anyhow::anyhow!(e));
+                continue;
+            }
+        };
+        if response.status() != StatusCode::OK {
+            return Ok(Download::NotFound(response.status()));
+        }
+        match response.bytes() {
+            Ok(b) => return Ok(Download::Ok(b.to_vec())),
+            Err(e) => {
+                last_err = Some(anyhow::anyhow!(e));
+                continue;
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("download failed")))
+}
+
 /// Download all crate files and put into spots that are expected by cargo from crates.io
 fn download_and_save(
     mirror_path: &Path,
     vendors: Vec<(String, Vec<Crate>)>,
     build_std: bool,
-    verbose: bool,
 ) -> anyhow::Result<()> {
     let total: u64 = vendors.iter().map(|(_, c)| c.len() as u64).sum();
-    let mp = if verbose {
-        None
-    } else {
-        Some(MultiProgress::new())
-    };
-    let pb = if let Some(mp) = &mp {
-        let pb = mp.add(ProgressBar::new(total));
-        pb.set_style(
-            ProgressStyle::with_template("[{bar:40}] {pos}/{len} downloading crates")
-                .unwrap()
-                .progress_chars("=> "),
-        );
-        Some(pb)
-    } else {
-        None
-    };
+    // Counter bar; worker threads advance it via `pb_inc` on the cloned `Span`.
+    let span = info_span!("download");
+    span.pb_set_style(&counter_style("downloading crates"));
+    span.pb_set_length(total);
+    let _enter = span.enter();
     let downloaded = AtomicUsize::new(0);
 
     vendors.into_par_iter().try_for_each(|(workspace, mut crates)| -> anyhow::Result<()> {
-        if verbose {
-            println!("[-] Vendoring: {workspace}");
-        }
-        let ws_pb = mp.as_ref().and_then(|mp| pb.as_ref().map(|pb| {
-            let ws_pb = mp.insert_before(pb, ProgressBar::new_spinner());
-            ws_pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
-            ws_pb.set_message(format!("Vendoring: {workspace}"));
-            ws_pb
-        }));
+        debug!("vendoring: {workspace}");
         let client = reqwest::blocking::Client::builder()
             .user_agent(format!("zerus/{} ({})", env!("CARGO_PKG_VERSION"), env!("CARGO_PKG_REPOSITORY")))
             .build()
@@ -68,59 +101,42 @@ fn download_and_save(
 
             // check if file already exists
             if !fs::exists(&crate_path).unwrap_or(false) {
-                let dl_pb = mp.as_ref().and_then(|mp| pb.as_ref().map(|pb| {
-                    let dl_pb = mp.insert_before(pb, ProgressBar::new_spinner());
-                    dl_pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
-                    dl_pb.set_message(format!("{name}-{version}"));
-                    dl_pb
-                }));
-                // download
-                let url = format!("https://static.crates.io/crates/{name}/{name}-{version}.crate");
-                if verbose {
-                    println!("[-] Downloading: {url}");
-                }
-                let Ok(response) = client.get(url).send() else {
-                    if let (Some(mp), Some(dl_pb)) = (&mp, &dl_pb) { mp.remove(dl_pb); }
-                    if let Some(pb) = &pb { pb.inc(1); }
-                    return Ok(());
-                };
+                let dl_span = info_span!("dl");
+                dl_span.pb_set_style(&ProgressStyle::with_template("  {wide_msg}").unwrap());
+                dl_span.pb_set_message(&format!("{name}-{version}"));
+                let _dl = dl_span.enter();
 
-                if response.status() != StatusCode::OK {
-                    if build_std {
-                        if verbose {
-                            println!("[-] Couldn't download {name}-{version}, not hosted on crates.io (this is fine if it's rustc internal library)");
+                let url = format!("https://static.crates.io/crates/{name}/{name}-{version}.crate");
+                debug!("downloading: {url}");
+                let bytes = match download_crate(&client, &url) {
+                    Ok(Download::Ok(bytes)) => bytes,
+                    Ok(Download::NotFound(_)) => {
+                        if build_std {
+                            debug!("couldn't download {name}-{version}, not hosted on crates.io (this is fine if it's a rustc internal library)");
+                            span.pb_inc(1);
+                            return Ok(());
                         }
-                        if let (Some(mp), Some(dl_pb)) = (&mp, &dl_pb) { mp.remove(dl_pb); }
-                        if let Some(pb) = &pb { pb.inc(1); }
+                        bail!("Couldn't download {name}-{version}, not hosted on crates.io");
+                    }
+                    Err(e) => {
+                        warn!("failed to download {name}-{version}: {e}");
+                        span.pb_inc(1);
                         return Ok(());
                     }
-                    if let (Some(mp), Some(dl_pb)) = (&mp, &dl_pb) { mp.remove(dl_pb); }
-                    bail!("Couldn't download {name}-{version}, not hosted on crates.io");
-                }
-
-                let Ok(response) = response.bytes() else {
-                    if let (Some(mp), Some(dl_pb)) = (&mp, &dl_pb) { mp.remove(dl_pb); }
-                    if let Some(pb) = &pb { pb.inc(1); }
-                    return Ok(());
                 };
 
                 fs::create_dir_all(&dir_crate_path)
                     .with_context(|| format!("failed to create directory {}", dir_crate_path.display()))?;
-                fs::write(&crate_path, response)
+                fs::write(&crate_path, bytes)
                     .with_context(|| format!("failed to write {}", crate_path.display()))?;
-                if let (Some(mp), Some(dl_pb)) = (&mp, &dl_pb) { mp.remove(dl_pb); }
             }
-            if let Some(pb) = &pb { pb.inc(1); }
+            span.pb_inc(1);
             downloaded.fetch_add(1, Ordering::Relaxed);
             Ok(())
         })?;
-        if let (Some(mp), Some(ws_pb)) = (&mp, &ws_pb) { mp.remove(ws_pb); }
         Ok(())
     })?;
 
-    if let Some(pb) = &pb {
-        pb.finish_and_clear();
-    }
     Ok(())
 }
 
@@ -141,16 +157,16 @@ fn get_deps(
         let mut crates = vec![];
         let mut cmd = MetadataCommand::new();
         cmd.manifest_path(workspace.clone());
-        println!("[-] Running `cargo metadata` for {workspace}");
+        info!("running `cargo metadata` for {workspace}");
         let package_graph = match cmd.build_graph() {
             Ok(p) => p,
             Err(CommandError(e)) => {
                 // most likely: "error: the manifest-path must be a path to a Cargo.toml file"
-                println!("[!] Could not run `cargo metadata`: {e:}");
+                warn!("could not run `cargo metadata`: {e:}");
                 return None;
             }
             Err(_) => {
-                println!("[!] Could not run `cargo metadata`");
+                warn!("could not run `cargo metadata`");
                 return None;
             }
         };
@@ -269,7 +285,13 @@ fn collect_all_deps(manifest: &CrateManifest) -> Vec<(String, String)> {
 /// Iteratively expand the mirror by parsing all downloaded .crate files,
 /// extracting their dependencies, resolving versions via the sparse index,
 /// and downloading any missing crates. Repeats until no new crates are found.
-fn expand_deps(mirror_path: &Path, verbose: bool) -> anyhow::Result<()> {
+///
+/// Note: this collects normal, dev, build, and target-specific dependencies
+/// while ignoring enabled features (see `collect_all_deps`), so the closure is
+/// much larger than `cargo metadata` resolution — even a tiny crate like
+/// `cfg-if` expands to thousands of crates. This runs for every `--crate`
+/// usage, not just `--get-feature-gated`.
+fn expand_deps(mirror_path: &Path) -> anyhow::Result<()> {
     let client = reqwest::blocking::Client::builder()
         .user_agent(format!(
             "zerus/{} ({})",
@@ -292,7 +314,7 @@ fn expand_deps(mirror_path: &Path, verbose: bool) -> anyhow::Result<()> {
                 let manifest = match extract_cargo_toml(crate_file) {
                     Ok(m) => m,
                     Err(e) => {
-                        eprintln!("[!] {e:#}");
+                        warn!("{e:#}");
                         return vec![];
                     }
                 };
@@ -331,110 +353,81 @@ fn expand_deps(mirror_path: &Path, verbose: bool) -> anyhow::Result<()> {
             })
             .collect();
 
-        // Resolve versions and download in parallel
+        // Resolve versions and download in parallel.
         let new_downloads = AtomicUsize::new(0);
-        let mp = if verbose {
-            None
-        } else {
-            Some(MultiProgress::new())
-        };
-        let pb = mp.as_ref().map(|mp| {
-            let pb = mp.add(ProgressBar::new(missing.len() as u64));
-            pb.set_style(
-                ProgressStyle::with_template(&format!("[{{bar:40}}] {{pos}}/{{len}} pass {pass}"))
-                    .unwrap()
-                    .progress_chars("=> "),
-            );
-            pb
-        });
+        let span = info_span!("expand", pass);
+        span.pb_set_style(&counter_style(&format!("pass {pass}")));
+        span.pb_set_length(missing.len() as u64);
+        let _enter = span.enter();
 
         missing.par_iter().for_each(|(name, req)| {
-            let dl_pb = mp.as_ref().and_then(|mp| {
-                pb.as_ref().map(|pb| {
-                    let dl_pb = mp.insert_before(pb, ProgressBar::new_spinner());
-                    dl_pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
-                    dl_pb.set_message(name.clone());
-                    dl_pb
-                })
-            });
-
-            let done = |dl_pb: Option<ProgressBar>| {
-                if let (Some(mp), Some(dl_pb)) = (&mp, dl_pb) {
-                    mp.remove(&dl_pb);
-                }
-                if let Some(pb) = &pb {
-                    pb.inc(1);
-                }
-            };
+            let dl_span = info_span!("dl");
+            dl_span.pb_set_style(&ProgressStyle::with_template("  {wide_msg}").unwrap());
+            dl_span.pb_set_message(name);
+            let _dl = dl_span.enter();
 
             let Some(resolved_version) = resolve_version(&client, name, req) else {
-                done(dl_pb);
+                // Usually a requirement with no matching non-yanked version; the
+                // depending crate resolved it elsewhere, so this isn't actionable.
+                debug!("could not resolve {name} {req}");
+                span.pb_inc(1);
                 return;
             };
 
             if existing.contains(&(name.clone(), resolved_version.clone())) {
-                done(dl_pb);
+                span.pb_inc(1);
                 return;
             }
 
             let Some(dir_crate_path) = get_crate_path(mirror_path, name, &resolved_version) else {
-                done(dl_pb);
+                span.pb_inc(1);
                 return;
             };
             let crate_path = dir_crate_path.join(format!("{name}-{resolved_version}.crate"));
 
             if fs::exists(&crate_path).unwrap_or(false) {
-                done(dl_pb);
+                span.pb_inc(1);
                 return;
             }
 
             let url =
                 format!("https://static.crates.io/crates/{name}/{name}-{resolved_version}.crate");
-            if let Some(dl_pb) = &dl_pb {
-                dl_pb.set_message(format!("{name}-{resolved_version}"));
-            }
-            if verbose {
-                println!("[-] [expand pass {pass}] Downloading: {url}");
-            }
+            dl_span.pb_set_message(&format!("{name}-{resolved_version}"));
+            debug!("downloading: {url}");
 
-            let Ok(response) = client.get(&url).send() else {
-                done(dl_pb);
-                return;
-            };
-            if response.status() != StatusCode::OK {
-                if verbose {
-                    println!("[-] Couldn't download {name}-{resolved_version}");
+            let bytes = match download_crate(&client, &url) {
+                Ok(Download::Ok(bytes)) => bytes,
+                Ok(Download::NotFound(status)) => {
+                    warn!("couldn't download {name}-{resolved_version}: HTTP {status}");
+                    span.pb_inc(1);
+                    return;
                 }
-                done(dl_pb);
-                return;
-            }
-            let Ok(bytes) = response.bytes() else {
-                done(dl_pb);
-                return;
+                Err(e) => {
+                    warn!("failed to download {name}-{resolved_version}: {e}");
+                    span.pb_inc(1);
+                    return;
+                }
             };
 
             if let Err(e) = fs::create_dir_all(&dir_crate_path) {
-                eprintln!(
-                    "[!] failed to create directory {}: {e}",
+                warn!(
+                    "failed to create directory {}: {e}",
                     dir_crate_path.display()
                 );
-                done(dl_pb);
+                span.pb_inc(1);
                 return;
             }
             if let Err(e) = fs::write(&crate_path, bytes) {
-                eprintln!("[!] failed to write {}: {e}", crate_path.display());
-                done(dl_pb);
+                warn!("failed to write {}: {e}", crate_path.display());
+                span.pb_inc(1);
                 return;
             }
             new_downloads.fetch_add(1, Ordering::Relaxed);
-            done(dl_pb);
+            span.pb_inc(1);
         });
 
         let count = new_downloads.load(Ordering::Relaxed);
-        if let Some(pb) = &pb {
-            pb.finish_with_message(format!("pass {pass}: downloaded {count} new crate(s)"));
-        }
-        println!("[-] [expand pass {pass}] Downloaded {count} new crate(s)");
+        info!("downloaded {count} new crate(s)");
 
         if count == 0 {
             break;
@@ -453,11 +446,10 @@ pub fn mirror(
     git_index_url: Option<String>,
     git_index: bool,
     get_feature_gated: bool,
-    verbose: bool,
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(&mirror_path)
         .with_context(|| format!("failed to create {}", mirror_path.display()))?;
-    println!("[-] Created {}", mirror_path.display());
+    info!("created {}", mirror_path.display());
 
     // Collect crates from workspaces (cargo metadata)
     let mut vendors: Vec<(String, Vec<Crate>)> = Vec::new();
@@ -479,7 +471,7 @@ pub fn mirror(
                 // No version specified, resolve latest from sparse index
                 match resolve_version(&client, spec, &VersionReq::STAR) {
                     Some(v) => {
-                        println!("[-] Resolved {spec} to latest version {v}");
+                        info!("resolved {spec} to latest version {v}");
                         (spec.to_string(), v)
                     }
                     None => {
@@ -495,24 +487,24 @@ pub fn mirror(
         }
     }
 
-    download_and_save(&mirror_path, vendors, build_std.is_some(), verbose)?;
-    println!("[-] Finished downloading crates");
+    download_and_save(&mirror_path, vendors, build_std.is_some())?;
+    info!("finished downloading crates");
 
     if get_feature_gated || !extra_crates.is_empty() {
-        println!("[-] Expanding feature-gated dependencies...");
-        expand_deps(&mirror_path, verbose)?;
-        println!("[-] Finished expanding dependencies");
+        info!("expanding feature-gated dependencies...");
+        expand_deps(&mirror_path)?;
+        info!("finished expanding dependencies");
     }
 
     if git_index {
-        println!("[-] Syncing git index crates.io");
+        info!("syncing git index crates.io");
         let repo = mirror_path.join("crates.io-index");
         if repo.exists() {
             pull(Path::new(&repo)).context("failed to pull git index")?;
         } else {
             clone(Path::new(&repo)).context("failed to clone git index")?;
         }
-        println!("[-] Done syncing git index crates.io");
+        info!("done syncing git index crates.io");
     }
 
     if let Some(url) = git_index_url {

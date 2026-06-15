@@ -3,6 +3,11 @@ mod build_std;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueHint};
+use tracing::error;
+use tracing_indicatif::IndicatifLayer;
+use tracing_subscriber::layer::{Layer, SubscriberExt};
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::EnvFilter;
 
 mod git;
 mod index;
@@ -93,12 +98,39 @@ enum Command {
     },
 }
 
-fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+fn main() {
+    if let Err(e) = run() {
+        error!("{e:#}");
+        std::process::exit(1);
+    }
+}
 
+fn run() -> anyhow::Result<()> {
     let args = Args::parse();
+
+    // `--verbose` raises the default level to `debug`; `RUST_LOG` overrides.
+    let default_level = if args.verbose { "debug" } else { "info" };
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(format!("zerus={default_level},info")));
+
+    // Deterministic output (no timestamps/ANSI) for snapshot tests.
+    let test_log = std::env::var_os("ZERUS_LOG_TEST").is_some();
+    let indicatif_layer = IndicatifLayer::new();
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_target(false)
+        .with_ansi(!test_log)
+        .with_writer(indicatif_layer.get_stderr_writer());
+
+    let fmt_layer = if test_log {
+        fmt_layer.without_time().boxed()
+    } else {
+        fmt_layer.boxed()
+    };
+    tracing_subscriber::registry()
+        .with(fmt_layer)
+        .with(indicatif_layer)
+        .with(filter)
+        .init();
 
     match args.command {
         Command::Mirror {
@@ -121,7 +153,6 @@ fn main() -> anyhow::Result<()> {
                 git_index_url,
                 git_index,
                 get_feature_gated,
-                args.verbose,
             )?;
         }
         Command::UpdateIndex {
@@ -130,7 +161,7 @@ fn main() -> anyhow::Result<()> {
         } => {
             let index_path = mirror_path.join("crates.io-index");
             let crates_path = mirror_path.join("crates");
-            index::update_index(&index_path, &crates_path, dl_url.as_deref(), args.verbose)?;
+            index::update_index(&index_path, &crates_path, dl_url.as_deref())?;
         }
         Command::Serve { mirror_path, bind } => {
             serve::serve(mirror_path, bind)?;

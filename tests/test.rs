@@ -13,7 +13,7 @@ fn test_old_nightly_version() {
     let tmp_dir = Builder::new().tempdir_in("./").unwrap();
     let tmp_dir_path = tmp_dir.keep();
     let output = cmd
-        .env("RUST_LOG", "none")
+        .env("ZERUS_LOG_TEST", "1") // deterministic log output (no timestamps/ANSI)
         .env("RAYON_NUM_THREADS", "1") // deterministic ordering
         .args([
             "--verbose",
@@ -32,7 +32,9 @@ fn test_old_nightly_version() {
         .unwrap();
     let rustup_home = std::str::from_utf8(&rustup_home_output.stdout).unwrap();
     let rustup_home = rustup_home.to_string().replace("\n", "");
-    let output = std::str::from_utf8(&output.stdout).unwrap();
+    // The full verbose activity log now goes through `tracing` to stderr.
+    // `ZERUS_LOG_TEST=1` strips timestamps/ANSI so this is deterministic.
+    let output = std::str::from_utf8(&output.stderr).unwrap().to_string();
 
     // replace Create <TMP_DIR>
     let tmp_dir = tmp_dir_path.to_str().unwrap();
@@ -58,7 +60,7 @@ fn test_new_nightly_version() {
     let tmp_dir = Builder::new().tempdir_in("./").unwrap();
     let tmp_dir_path = tmp_dir.keep();
     let output = cmd
-        .env("RUST_LOG", "none")
+        .env("ZERUS_LOG_TEST", "1") // deterministic log output (no timestamps/ANSI)
         .env("RAYON_NUM_THREADS", "1") // deterministic ordering
         .args([
             "--verbose",
@@ -77,7 +79,9 @@ fn test_new_nightly_version() {
         .unwrap();
     let rustup_home = std::str::from_utf8(&rustup_home_output.stdout).unwrap();
     let rustup_home = rustup_home.to_string().replace("\n", "");
-    let output = std::str::from_utf8(&output.stdout).unwrap();
+    // The full verbose activity log now goes through `tracing` to stderr.
+    // `ZERUS_LOG_TEST=1` strips timestamps/ANSI so this is deterministic.
+    let output = std::str::from_utf8(&output.stderr).unwrap().to_string();
 
     // replace Create <TMP_DIR>
     let tmp_dir = tmp_dir_path.to_str().unwrap();

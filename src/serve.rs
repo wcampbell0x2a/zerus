@@ -9,6 +9,7 @@ use axum::routing::get;
 use axum::Json;
 use serde::Serialize;
 use tower_http::trace::TraceLayer;
+use tracing::info;
 
 use crate::get_crate_path;
 use crate::index::{extract_cargo_toml, IndexEntry};
@@ -187,7 +188,7 @@ pub fn serve(mirror_path: PathBuf, bind: String) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let listener = tokio::net::TcpListener::bind(&bind).await?;
-        println!("[-] Serving on http://{bind}");
+        info!("serving on http://{bind}");
         axum::serve(listener, app).await?;
         Ok::<_, anyhow::Error>(())
     })?;

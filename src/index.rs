@@ -5,11 +5,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
 use flate2::read::GzDecoder;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::ProgressStyle;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tar::Archive;
+use tracing::{debug, info, info_span, warn};
+use tracing_indicatif::span_ext::IndicatifSpanExt;
 
 use crate::get_index_prefix;
 
@@ -306,39 +308,34 @@ pub fn update_index(
     index_path: &Path,
     crates_path: &Path,
     dl_url: Option<&str>,
-    verbose: bool,
 ) -> anyhow::Result<()> {
     fs::create_dir_all(index_path).context("failed to create index directory")?;
 
     let crate_files = find_crate_files(crates_path);
-    println!("[-] Found {} .crate files", crate_files.len());
+    info!("found {} .crate files", crate_files.len());
 
-    let pb = ProgressBar::new(crate_files.len() as u64);
-    if verbose {
-        pb.set_draw_target(indicatif::ProgressDrawTarget::hidden());
-    } else {
-        pb.set_style(
-            ProgressStyle::with_template("[{bar:40}] {pos}/{len} indexing crates")
-                .unwrap()
-                .progress_chars("=> "),
-        );
-    }
+    // The counter bar is a tracing span; `pb_inc` from worker threads advances it
+    // through the cloned `Span` handle.
+    let span = info_span!("index");
+    span.pb_set_style(
+        &ProgressStyle::with_template("[{bar:40}] {pos}/{len} indexing crates")
+            .unwrap()
+            .progress_chars("=> "),
+    );
+    span.pb_set_length(crate_files.len() as u64);
+    let _enter = span.enter();
 
     // In parallel, find all crate files and compute info
     let entries: Vec<IndexEntry> = crate_files
         .par_iter()
         .map(|crate_file| {
-            if verbose {
-                println!("[-] Processing: {}", crate_file.display());
-            }
+            debug!("processing: {}", crate_file.display());
             let cksum = compute_cksum(crate_file)?;
             let manifest = extract_cargo_toml(crate_file)?;
-            pb.inc(1);
+            span.pb_inc(1);
             Ok(manifest_to_index_entry(&manifest, cksum))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-
-    pb.finish_and_clear();
 
     // Sort by crate name
     let mut grouped: HashMap<String, Vec<IndexEntry>> = HashMap::new();
@@ -361,12 +358,12 @@ pub fn update_index(
             .with_context(|| format!("failed to create {}", config_path.display()))?;
         crate::git::write_config_json(url, file).context("failed to write config.json")?;
     } else if !index_path.join("config.json").exists() {
-        eprintln!(
-            "[WARN] No config.json found in index and --dl-url not provided. The index will be unusable without it."
+        warn!(
+            "no config.json found in index and --dl-url not provided; the index will be unusable without it"
         );
     }
 
-    println!("[-] Index updated at {}", index_path.display());
+    info!("index updated at {}", index_path.display());
 
     Ok(())
 }
