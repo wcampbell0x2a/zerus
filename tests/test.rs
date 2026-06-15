@@ -120,6 +120,93 @@ fn test_get_feature_gated() {
     assert_success(&output);
 }
 
+#[test]
+fn test_generate_manifest_and_cull() {
+    let zerus = assert_cmd::cargo::cargo_bin("zerus");
+
+    let tmp_dir = Builder::new().tempdir_in("./").unwrap();
+    let mirror = tmp_dir.path();
+
+    // fake mirror layout: crates/{prefix}/{name}/{version}/{name}-{version}.crate
+    let crates = [
+        ("se/rd", "serde", "1.0.210"),
+        ("to/ki", "tokio", "1.40.0"),
+        ("3/s", "syn", "2.0.77"),
+    ];
+    for (prefix, name, version) in crates {
+        let dir = mirror.join("crates").join(prefix).join(name).join(version);
+        std::fs::create_dir_all(&dir).unwrap();
+        File::create(dir.join(format!("{name}-{version}.crate"))).unwrap();
+    }
+
+    // generate-manifest writes sorted name@version lines
+    let manifest_path = mirror.join("manifest.txt");
+    let output = Command::new(&zerus)
+        .args([
+            "generate-manifest",
+            mirror.to_str().unwrap(),
+            "--output",
+            manifest_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_success(&output);
+    assert_eq!(
+        std::fs::read_to_string(&manifest_path).unwrap(),
+        "serde@1.0.210\nsyn@2.0.77\ntokio@1.40.0\n"
+    );
+
+    // manifest of previously transferred crates, including one not on disk
+    let transferred = mirror.join("transferred.txt");
+    std::fs::write(&transferred, "serde@1.0.210\nsyn@2.0.77\nanyhow@1.0.0\n").unwrap();
+
+    let serde_crate = mirror.join("crates/se/rd/serde/1.0.210/serde-1.0.210.crate");
+    let syn_crate = mirror.join("crates/3/s/syn/2.0.77/syn-2.0.77.crate");
+    let tokio_crate = mirror.join("crates/to/ki/tokio/1.40.0/tokio-1.40.0.crate");
+
+    // dry-run removes nothing
+    let output = Command::new(&zerus)
+        .args([
+            "cull",
+            mirror.to_str().unwrap(),
+            transferred.to_str().unwrap(),
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert_success(&output);
+    assert!(serde_crate.exists());
+    assert!(syn_crate.exists());
+    assert!(tokio_crate.exists());
+
+    // cull removes listed crates, prunes empty dirs, and keeps the rest
+    let output = Command::new(&zerus)
+        .args([
+            "cull",
+            mirror.to_str().unwrap(),
+            transferred.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_success(&output);
+    assert!(!serde_crate.exists());
+    assert!(!mirror.join("crates/se").exists());
+    assert!(!syn_crate.exists());
+    assert!(!mirror.join("crates/3").exists());
+    assert!(tokio_crate.exists());
+
+    // only the remaining crate shows up in a new manifest
+    let output = Command::new(&zerus)
+        .args(["generate-manifest", mirror.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_success(&output);
+    assert_eq!(
+        std::str::from_utf8(&output.stdout).unwrap(),
+        "tokio@1.40.0\n"
+    );
+}
+
 fn test_build_std(nightly_ver: &str, tmp_dir_path: std::path::PathBuf, port: u32) {
     // Build our own index from the downloaded .crate files
     let path = assert_cmd::cargo::cargo_bin("zerus");

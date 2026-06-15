@@ -11,6 +11,7 @@ use tracing_subscriber::EnvFilter;
 
 mod git;
 mod index;
+mod manifest;
 mod mirror;
 mod serve;
 
@@ -87,6 +88,28 @@ enum Command {
         #[arg(value_hint = ValueHint::Url, value_parser = validate_url)]
         dl_url: Option<String>,
     },
+    /// Write a manifest (name@version per line) of all crates in the mirror
+    GenerateManifest {
+        /// Path to mirror directory (contains crates/)
+        mirror_path: PathBuf,
+
+        /// Output file (defaults to stdout)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// Remove crates listed in manifest(s) from the mirror to avoid re-transferring them
+    Cull {
+        /// Path to mirror directory (contains crates/)
+        mirror_path: PathBuf,
+
+        /// Manifest files from previous transfers (union is culled)
+        #[arg(required = true)]
+        manifests: Vec<PathBuf>,
+
+        /// Only print what would be removed
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Serve crate registry with sparse index, downloads, and search
     Serve {
         /// Path to mirror directory
@@ -162,6 +185,20 @@ fn run() -> anyhow::Result<()> {
             let index_path = mirror_path.join("crates.io-index");
             let crates_path = mirror_path.join("crates");
             index::update_index(&index_path, &crates_path, dl_url.as_deref())?;
+        }
+        Command::GenerateManifest {
+            mirror_path,
+            output,
+        } => {
+            let crates = manifest::generate(&mirror_path)?;
+            manifest::write_manifest(&crates, output.as_deref())?;
+        }
+        Command::Cull {
+            mirror_path,
+            manifests,
+            dry_run,
+        } => {
+            manifest::cull(&mirror_path, &manifests, dry_run)?;
         }
         Command::Serve { mirror_path, bind } => {
             serve::serve(mirror_path, bind)?;

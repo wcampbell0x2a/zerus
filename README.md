@@ -43,6 +43,19 @@ $ zerus mirror new-mirror rust-playground/top-crates/Cargo.toml
 ### Transfer to offline network
 Copy the mirror directory to your proxy or offline network.
 
+### Repeat transfers
+To avoid carrying crates that already made a previous trip, record each transfer with
+`generate-manifest` and use `cull` to drop already-transferred crates before the next one.
+```console
+$ zerus mirror new-mirror Cargo.toml                        # download everything
+$ zerus cull new-mirror transfers/*.txt                     # remove crates from previous transfers
+$ zerus generate-manifest new-mirror -o transfers/$(date +%F).txt   # record this transfer
+# copy new-mirror to the offline network, keep transfers/ locally
+```
+`cull` takes any number of manifest files and removes the union of their entries; pass
+`--dry-run` to preview what would be deleted. Run `update-index` on the offline network
+after merging the new crates into the existing mirror.
+
 ### Generate index
 On the offline network, use `update-index` to generate a registry index from the `.crate` files.
 ```console
