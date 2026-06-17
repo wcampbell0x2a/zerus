@@ -40,10 +40,7 @@ enum Download {
 /// a short backoff. A non-200 response is not retried — it's returned as
 /// `NotFound` for the caller to handle. Returns `Err` only after exhausting
 /// retries.
-fn download_crate(
-    client: &reqwest::blocking::Client,
-    url: &str,
-) -> anyhow::Result<Download> {
+fn download_crate(client: &reqwest::blocking::Client, url: &str) -> anyhow::Result<Download> {
     const ATTEMPTS: u32 = 3;
     let mut last_err = None;
     for attempt in 0..ATTEMPTS {
