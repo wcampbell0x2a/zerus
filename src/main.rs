@@ -3,9 +3,15 @@ mod build_std;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueHint};
+use tracing::error;
+use tracing_indicatif::IndicatifLayer;
+use tracing_subscriber::layer::{Layer, SubscriberExt};
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::EnvFilter;
 
 mod git;
 mod index;
+mod manifest;
 mod mirror;
 mod serve;
 
@@ -35,7 +41,7 @@ struct Args {
     #[command(subcommand)]
     command: Command,
 
-    /// Print each download/processing line instead of progress bars
+    /// Show the full log of every download/processing line (debug level)
     #[arg(short, long, global = true)]
     verbose: bool,
 }
@@ -50,7 +56,9 @@ enum Command {
         /// list of Cargo.toml files to vendor depends
         workspaces: Vec<String>,
 
-        /// Crates to mirror (format: name@version or name for latest, e.g. reqwest@0.12.8 or reqwest)
+        /// Crates to mirror (format: name@version or name for latest, e.g. reqwest@0.12.8 or reqwest).
+        /// Implies --get-feature-gated: downloads the full recursive dependency closure
+        /// (including dev/build deps, ignoring features), which can be thousands of crates
         #[arg(long = "crate", value_name = "NAME[@VERSION]")]
         extra_crates: Vec<String>,
 
@@ -68,7 +76,9 @@ enum Command {
         #[arg(long)]
         git_index: bool,
 
-        /// For each depends, extract and grab all depends. This ignores enabled features.
+        /// For each depends, extract and grab all depends. This ignores enabled features
+        /// and includes dev/build dependencies, so even a small crate can expand the
+        /// mirror to thousands of crates
         #[arg(long)]
         get_feature_gated: bool,
     },
@@ -82,6 +92,28 @@ enum Command {
         #[arg(value_hint = ValueHint::Url, value_parser = validate_url)]
         dl_url: Option<String>,
     },
+    /// Write a manifest (name@version per line) of all crates in the mirror
+    GenerateManifest {
+        /// Path to mirror directory (contains crates/)
+        mirror_path: PathBuf,
+
+        /// Output file (defaults to stdout)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// Remove crates listed in manifest(s) from the mirror to avoid re-transferring them
+    Cull {
+        /// Path to mirror directory (contains crates/)
+        mirror_path: PathBuf,
+
+        /// Manifest files from previous transfers (union is culled)
+        #[arg(required = true)]
+        manifests: Vec<PathBuf>,
+
+        /// Only print what would be removed
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Serve crate registry with sparse index, downloads, and search
     Serve {
         /// Path to mirror directory
@@ -93,12 +125,39 @@ enum Command {
     },
 }
 
-fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+fn main() {
+    if let Err(e) = run() {
+        error!("{e:#}");
+        std::process::exit(1);
+    }
+}
 
+fn run() -> anyhow::Result<()> {
     let args = Args::parse();
+
+    // `--verbose` raises the default level to `debug`; `RUST_LOG` overrides.
+    let default_level = if args.verbose { "debug" } else { "info" };
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(format!("zerus={default_level},info")));
+
+    // Deterministic output (no timestamps/ANSI) for snapshot tests.
+    let test_log = std::env::var_os("ZERUS_LOG_TEST").is_some();
+    let indicatif_layer = IndicatifLayer::new();
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_target(false)
+        .with_ansi(!test_log)
+        .with_writer(indicatif_layer.get_stderr_writer());
+
+    let fmt_layer = if test_log {
+        fmt_layer.without_time().boxed()
+    } else {
+        fmt_layer.boxed()
+    };
+    tracing_subscriber::registry()
+        .with(fmt_layer)
+        .with(indicatif_layer)
+        .with(filter)
+        .init();
 
     match args.command {
         Command::Mirror {
@@ -121,7 +180,6 @@ fn main() -> anyhow::Result<()> {
                 git_index_url,
                 git_index,
                 get_feature_gated,
-                args.verbose,
             )?;
         }
         Command::UpdateIndex {
@@ -130,7 +188,21 @@ fn main() -> anyhow::Result<()> {
         } => {
             let index_path = mirror_path.join("crates.io-index");
             let crates_path = mirror_path.join("crates");
-            index::update_index(&index_path, &crates_path, dl_url.as_deref(), args.verbose)?;
+            index::update_index(&index_path, &crates_path, dl_url.as_deref())?;
+        }
+        Command::GenerateManifest {
+            mirror_path,
+            output,
+        } => {
+            let crates = manifest::generate(&mirror_path)?;
+            manifest::write_manifest(&crates, output.as_deref())?;
+        }
+        Command::Cull {
+            mirror_path,
+            manifests,
+            dry_run,
+        } => {
+            manifest::cull(&mirror_path, &manifests, dry_run)?;
         }
         Command::Serve { mirror_path, bind } => {
             serve::serve(mirror_path, bind)?;

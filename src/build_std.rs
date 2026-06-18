@@ -1,6 +1,8 @@
 use std::process::Stdio;
 use std::{fs, process::Command};
 
+use tracing::{info, warn};
+
 /// Work around for https://github.com/rust-lang/wg-cargo-std-aware/issues/23
 pub fn prepare_build_std(version: &str) -> Option<String> {
     let sysroot = Command::new("rustc")
@@ -15,13 +17,13 @@ pub fn prepare_build_std(version: &str) -> Option<String> {
 
     let base = format!("{sysroot}/lib/rustlib/src");
     if !fs::exists(&base).unwrap_or(false) {
-        println!("[!] rust-src not found, running: `rustup +{version} component add rust-src`");
+        info!("rust-src not found, running: `rustup +{version} component add rust-src`");
         let status = Command::new("rustup")
             .args([&format!("+{version}"), "component", "add", "rust-src"])
             .status()
             .ok()?;
         if !status.success() {
-            println!("[!] failed to install rust-src");
+            warn!("failed to install rust-src");
             return None;
         }
     }
@@ -38,7 +40,7 @@ pub fn prepare_build_std(version: &str) -> Option<String> {
     if let Some(from) = from {
         let to = format!("{sysroot}/lib/rustlib/src/rust/library/test/Cargo.lock");
         if fs::copy(from, to).is_err() {
-            println!("[!] could not write");
+            warn!("could not write");
             return None;
         }
     }

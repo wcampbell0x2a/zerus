@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 06-18-2026
+- Add subcommand `generate-manifest`: write sorted `name@version` lines for all crates in a mirror (to a file or stdout)
+- Add subcommand: `cull` : remove the crates listed in one or more manifests from a mirror, pruning now-empty directories,
+  with `--dry-run` to preview
+- Retry transient transport failures when downloading crates with backoff, and report non-200 responses as not found
+
 ## [0.14.0] - 05-25-2026
 - Add `serve` subcommand for serving crate registry with sparse index, downloads, and search support.
 - Add `--crate` option to mirror specific crates without a `Cargo.toml` (e.g. `--crate reqwest@0.12.8`)
