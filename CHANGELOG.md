@@ -6,6 +6,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 07-07-2026
+- Add multi-threaded `update-index` and progress bar
+
 ## [0.15.0] - 06-18-2026
 - Add subcommand `generate-manifest`: write sorted `name@version` lines for all crates in a mirror (to a file or stdout)
 - Add subcommand: `cull` : remove the crates listed in one or more manifests from a mirror, pruning now-empty directories,
