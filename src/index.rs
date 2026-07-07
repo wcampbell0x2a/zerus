@@ -109,24 +109,34 @@ fn default_true() -> bool {
 }
 
 pub fn find_crate_files(crates_path: &Path) -> Vec<PathBuf> {
-    let mut result = Vec::new();
-    find_crate_files_recursive(crates_path, &mut result);
-    result
+    find_crate_files_recursive(crates_path, &|| {})
 }
 
-fn find_crate_files_recursive(dir: &Path, result: &mut Vec<PathBuf>) {
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
+// Recurse into subdirs in parallel via rayon. `on_found` fires per .crate hit;
+// pass `&|| {}` to skip it.
+fn find_crate_files_recursive(dir: &Path, on_found: &(impl Fn() + Sync)) -> Vec<PathBuf> {
+    let entries: Vec<PathBuf> = match fs::read_dir(dir) {
+        Ok(e) => e.flatten().map(|entry| entry.path()).collect(),
+        Err(_) => return Vec::new(),
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            find_crate_files_recursive(&path, result);
-        } else if path.extension().is_some_and(|e| e == "crate") {
-            result.push(path);
-        }
-    }
+    entries
+        .par_iter()
+        .flat_map(|path| {
+            if path.is_dir() {
+                find_crate_files_recursive(path, on_found)
+            } else if path.extension().is_some_and(|e| e == "crate") {
+                on_found();
+                vec![path.clone()]
+            } else {
+                Vec::new()
+            }
+        })
+        .collect()
+}
+
+// Same as find_crate_files, but ticks the span's progress bar as it goes.
+fn find_crate_files_with_progress(crates_path: &Path, span: &tracing::Span) -> Vec<PathBuf> {
+    find_crate_files_recursive(crates_path, &|| span.pb_inc(1))
 }
 
 pub fn compute_cksum(path: &Path) -> anyhow::Result<String> {
@@ -311,11 +321,19 @@ pub fn update_index(
 ) -> anyhow::Result<()> {
     fs::create_dir_all(index_path).context("failed to create index directory")?;
 
-    let crate_files = find_crate_files(crates_path);
+    info!("scanning {} for .crate files...", crates_path.display());
+    let scan_span = info_span!("scan");
+    scan_span.pb_set_style(
+        &ProgressStyle::with_template("{spinner} scanning crates dir ({pos} found)").unwrap(),
+    );
+    let crate_files = {
+        let _enter = scan_span.enter();
+        find_crate_files_with_progress(crates_path, &scan_span)
+    };
+    drop(scan_span);
     info!("found {} .crate files", crate_files.len());
 
-    // The counter bar is a tracing span; `pb_inc` from worker threads advances it
-    // through the cloned `Span` handle.
+    // Progress bar lives on this span; worker threads pb_inc through the clone.
     let span = info_span!("index");
     span.pb_set_style(
         &ProgressStyle::with_template("[{bar:40}] {pos}/{len} indexing crates")
