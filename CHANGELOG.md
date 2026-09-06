@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.1](https://github.com/wcampbell0x2a/zerus/compare/v0.16.0...v0.16.1) - 2026-09-06
+
+### Added
+
+- Add a web UI at the root path of `serve`, which shows the crates in the mirror
+- Add `--manifests` to `serve`, to browse the manifests from previous transfers
+
+### Other
+
+- Update github actions
+- Add release-plz for automated releases
+
 ## [0.16.0] - 07-07-2026
 - Add multi-threaded `update-index` and progress bar
 
