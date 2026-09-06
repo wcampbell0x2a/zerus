@@ -6,7 +6,7 @@ zerus
 [<img alt="docs.rs" src="https://img.shields.io/badge/docs.rs-zerus-66c2a5?style=for-the-badge&labelColor=555555&logo=docs.rs" height="20">](https://docs.rs/zerus)
 [<img alt="build status" src="https://img.shields.io/github/actions/workflow/status/wcampbell0x2a/zerus/main.yml?branch=master&style=for-the-badge" height="20">](https://github.com/wcampbell0x2a/zerus/actions?query=branch%3Amaster)
 
-Lightweight tool for creating project-specific and/or general offline crates.io mirrors
+Lightweight tool for creating and hosting project-specific and/or general offline crates.io mirrors
 
 ## Build zerus
 Either build from published source in crates.io.
@@ -74,6 +74,13 @@ $ zerus serve new-mirror --bind 0.0.0.0:8080
 Enable request logging with:
 ```console
 $ RUST_LOG=tower_http=debug zerus serve new-mirror
+```
+
+#### Browse past transfers
+Point `--manifests` at the directory of manifest files written by `generate-manifest` to
+browse them in the web UI at the root path.
+```console
+$ zerus serve new-mirror --manifests transfers/
 ```
 
 ### Build with mirror
