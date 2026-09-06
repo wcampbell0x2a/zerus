@@ -1,0 +1,122 @@
+name: release-plz
+
+on:
+  push:
+    branches: [ master ]
+
+permissions:
+  contents: read
+
+env:
+  BIN: zerus
+
+jobs:
+  # Publish the crate, create the tag, and create the draft GitHub release.
+  release-plz-release:
+    name: release-plz release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # Necessary for crates.io trusted publishing.
+      id-token: write
+    outputs:
+      releases: ${{ steps.release-plz.outputs.releases }}
+      releases_created: ${{ steps.release-plz.outputs.releases_created }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: stable
+      - name: Run release-plz
+        id: release-plz
+        uses: release-plz/action@1a0c5beec2fe4e91727549b5d2d0715ed28684bb # v0.5.131
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Open or update the release pull request with the version and changelog changes.
+  release-plz-pr:
+    name: release-plz pr
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: stable
+      - name: Run release-plz
+        uses: release-plz/action@1a0c5beec2fe4e91727549b5d2d0715ed28684bb # v0.5.131
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Attach the binaries to the draft release that release-plz created.
+  release-bins:
+    name: attach binaries
+    needs: release-plz-release
+    if: needs.release-plz-release.outputs.releases_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ fromJSON(needs.release-plz-release.outputs.releases)[0].tag }}
+    strategy:
+      fail-fast: false
+      matrix:
+        targets:
+          - x86_64-unknown-linux-musl
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Build the released commit, not the most recent commit on master.
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: stable
+          target: ${{ matrix.targets }}
+      - run: cargo install cargo-quickinstall
+      - run: cargo quickinstall cross
+      - run: cross build --bin ${{ env.BIN }} --locked --target ${{ matrix.targets }} --profile=dist
+
+      - name: archive
+        run: |
+          tar -czvf ${{ env.BIN }}-${{ matrix.targets }}.tar.gz \
+              -C target/${{ matrix.targets }}/dist/ ${{ env.BIN }}
+
+      - name: Upload binary to release
+        uses: svenstaro/upload-release-action@29e53e917877a24fad85510ded594ab3c9ca12de # v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: ${{ env.BIN }}-${{ matrix.targets }}.tar.gz
+          asset_name: ${{ env.BIN }}-${{ env.TAG }}-${{ matrix.targets }}.tar.gz
+          tag: ${{ env.TAG }}
+          overwrite: true
+
+  # Make the release visible now that it has all of its binaries.
+  publish-release:
+    name: publish release
+    needs: [release-plz-release, release-bins]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Remove the draft flag from the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ fromJSON(needs.release-plz-release.outputs.releases)[0].tag }}
+        run: gh release edit "$TAG" --draft=false
