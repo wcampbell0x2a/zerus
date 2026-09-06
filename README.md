@@ -76,6 +76,20 @@ Enable request logging with:
 $ RUST_LOG=tower_http=debug zerus serve new-mirror
 ```
 
+#### Serve with docker
+Each release pushes an image that runs `zerus serve`. Mount the mirror at `/mirror`.
+```console
+$ docker run -p 8080:8080 -v "$PWD/new-mirror:/mirror:ro" ghcr.io/wcampbell0x2a/zerus
+```
+
+Add arguments to replace the default command, for example to browse past transfers:
+```console
+$ docker run -p 8080:8080 -v "$PWD/new-mirror:/mirror:ro" ghcr.io/wcampbell0x2a/zerus \
+      serve /mirror --bind 0.0.0.0:8080 --manifests /mirror/manifests
+```
+
+Use `latest`, or pin to a version tag such as `ghcr.io/wcampbell0x2a/zerus:0.16.0`.
+
 #### Browse past transfers
 Point `--manifests` at the directory of manifest files written by `generate-manifest` to
 browse them in the web UI at the root path.

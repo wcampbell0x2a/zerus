@@ -37,3 +37,14 @@ jobs:
         with:
           name: ${{ matrix.bins }}-${{ matrix.targets }}.tar.gz
           path: ${{ matrix.bins }}-${{ matrix.targets }}.tar.gz
+
+      # Build the image here too, so that a broken Dockerfile fails before release.
+      - name: build image
+        if: matrix.bins == 'zerus'
+        run: |
+          docker build -t zerus:ci \
+              --build-arg BIN=target/${{ matrix.targets }}/dist/${{ matrix.bins }} .
+
+      - name: check that the image runs
+        if: matrix.bins == 'zerus'
+        run: docker run --rm zerus:ci --version

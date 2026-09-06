@@ -106,10 +106,61 @@ jobs:
           tag: ${{ env.TAG }}
           overwrite: true
 
+  # Push the container image that hosts a mirror with `zerus serve`.
+  release-image:
+    name: push image
+    needs: release-plz-release
+    if: needs.release-plz-release.outputs.releases_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      TAG: ${{ fromJSON(needs.release-plz-release.outputs.releases)[0].tag }}
+      TARGET: x86_64-unknown-linux-musl
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Build the released commit, not the most recent commit on master.
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master
+        with:
+          toolchain: stable
+          target: ${{ env.TARGET }}
+      - run: cargo install cargo-quickinstall
+      - run: cargo quickinstall cross
+      - run: cross build --bin ${{ env.BIN }} --locked --target ${{ env.TARGET }} --profile=dist
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Tag with the version (without the leading "v") and with "latest".
+      - name: metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ env.TAG }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ env.TAG }}
+            type=raw,value=latest
+
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          build-args: BIN=target/${{ env.TARGET }}/dist/${{ env.BIN }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
   # Make the release visible now that it has all of its binaries.
   publish-release:
     name: publish release
-    needs: [release-plz-release, release-bins]
+    needs: [release-plz-release, release-bins, release-image]
     runs-on: ubuntu-latest
     permissions:
       contents: write
