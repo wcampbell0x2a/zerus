@@ -122,6 +122,10 @@ enum Command {
         /// Address to bind to
         #[arg(long, default_value = "0.0.0.0:8080")]
         bind: String,
+
+        /// Directory of manifest files from previous transfers, browsable in the web UI
+        #[arg(long, value_name = "DIR")]
+        manifests: Option<PathBuf>,
     },
 }
 
@@ -204,8 +208,12 @@ fn run() -> anyhow::Result<()> {
         } => {
             manifest::cull(&mirror_path, &manifests, dry_run)?;
         }
-        Command::Serve { mirror_path, bind } => {
-            serve::serve(mirror_path, bind)?;
+        Command::Serve {
+            mirror_path,
+            bind,
+            manifests,
+        } => {
+            serve::serve(mirror_path, bind, manifests)?;
         }
     }
 
