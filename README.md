@@ -51,9 +51,9 @@ To avoid carrying crates that already made a previous trip, record each transfer
 `generate-manifest` and use `cull` to drop already-transferred crates before the next one.
 ```console
 $ zerus mirror new-mirror Cargo.toml                        # download everything
-$ zerus cull new-mirror transfers/*.txt                     # remove crates from previous transfers
-$ zerus generate-manifest new-mirror -o transfers/$(date +%F).txt   # record this transfer
-# copy new-mirror to the offline network, keep transfers/ locally
+$ zerus cull new-mirror manifests/*.txt                     # remove crates from previous manifests
+$ zerus generate-manifest new-mirror -o manifests/$(date +%F).txt   # record this transfer
+# copy new-mirror to the offline network, keep manifests/ locally
 ```
 `cull` takes any number of manifest files and removes the union of their entries; pass
 `--dry-run` to preview what would be deleted. Run `update-index` on the offline network
@@ -82,7 +82,7 @@ Each release pushes an image that runs `zerus serve`. Mount the mirror at `/mirr
 $ docker run -p 8080:8080 -v "$PWD/new-mirror:/mirror:ro" ghcr.io/wcampbell0x2a/zerus
 ```
 
-Add arguments to replace the default command, for example to browse past transfers:
+Add arguments to replace the default command, for example to browse past manifests:
 ```console
 $ docker run -p 8080:8080 -v "$PWD/new-mirror:/mirror:ro" ghcr.io/wcampbell0x2a/zerus \
       serve /mirror --bind 0.0.0.0:8080 --manifests /mirror/manifests
@@ -90,11 +90,11 @@ $ docker run -p 8080:8080 -v "$PWD/new-mirror:/mirror:ro" ghcr.io/wcampbell0x2a/
 
 Use `latest`, or pin to a version tag such as `ghcr.io/wcampbell0x2a/zerus:0.16.0`.
 
-#### Browse past transfers
+#### Browse past manifests
 Point `--manifests` at the directory of manifest files written by `generate-manifest` to
 browse them in the web UI at the root path.
 ```console
-$ zerus serve new-mirror --manifests transfers/
+$ zerus serve new-mirror --manifests manifests/
 ```
 
 ### Build with mirror
