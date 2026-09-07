@@ -12,7 +12,7 @@ categories = ["development-tools"]
 keywords = ["offline", "mirror", "crates", "download", "vendor"]
 
 [dependencies]
-clap = { version = "4.5.13", features = ["derive"] }
+clap = { version = "4.5.13", features = ["derive", "env"] }
 reqwest = { version = "0.12.8", default-features = false, features = ["blocking", "rustls-tls", "http2"] }
 anyhow = "1.0.90"
 guppy = "0.17.5"
@@ -25,7 +25,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1.0"
 semver = "1"
-axum = "0.8"
+axum = { version = "0.8", features = ["multipart"] }
 indicatif = "0.18"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 tracing = "0.1"
@@ -34,6 +34,11 @@ tower-http = { version = "0.6", features = ["trace"] }
 tracing-indicatif = "0.3"
 maud = { version = "0.27.0", features = ["axum"] }
 time = { version = "0.3", features = ["formatting", "macros"] }
+# `push_file_from_path` opens each file only while it is read, which packing a mirror of a
+# few thousand crates needs. Point back at the release once
+# https://github.com/wcampbell0x2a/backhand/pull/812 is merged and published.
+backhand = { version = "0.25.2", default-features = false, features = ["zstd", "parallel"], git = "https://github.com/wcampbell0x2a/backhand", branch = "add-lazy-file-writing" }
+tempfile = "3.13.0"
 
 
 [dev-dependencies]

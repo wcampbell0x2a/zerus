@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use axum::extract::{Query, State};
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::extract::{DefaultBodyLimit, Multipart, Query, State};
+use axum::http::header::{ACCEPT, AUTHORIZATION};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use maud::{html, Markup, PreEscaped, DOCTYPE};
 use serde::{Deserialize, Serialize};
@@ -24,7 +26,30 @@ struct AppState {
     mirror_path: PathBuf,
     /// Directory of manifest files from previous transfers, if `--manifests` was given
     manifests_path: Option<PathBuf>,
+    /// Uploads are refused unless `--upload-token` set this
+    upload_token: Option<String>,
+    /// Written to config.json when an upload rebuilds the index
+    dl_url: Option<String>,
+    /// The last few uploads, newest first, shown on the web UI
+    uploads: Mutex<Vec<Upload>>,
 }
+
+/// One accepted upload, kept in memory for the web UI
+struct Upload {
+    /// File name the client sent, for matching against the sender's records
+    name: String,
+    added: usize,
+    skipped: usize,
+    at: SystemTime,
+}
+
+/// How many past uploads the web UI shows. Uploads are a running log, not a record; the
+/// manifests dir is the record.
+const UPLOAD_HISTORY: usize = 20;
+
+/// Reject an upload larger than this. A transfer of a full mirror is big, so the ceiling is
+/// generous; it exists to stop a runaway request from filling the disk.
+const MAX_UPLOAD_BYTES: usize = 16 * 1024 * 1024 * 1024;
 
 #[derive(Serialize)]
 struct SearchResponse {
@@ -361,8 +386,33 @@ fn page(title: &str, body: Markup) -> Markup {
     page_with_search(title, "", Focus::Page, body)
 }
 
-/// The page shell. The search box lives in the header, so it is on every page.
+/// Whether to show the uploads link in the header.
+///
+/// Set once at startup and read by the page shell, which every handler shares and which
+/// otherwise takes no state.
+static UPLOADS_ENABLED: AtomicBool = AtomicBool::new(false);
+
+fn uploads_enabled() -> bool {
+    UPLOADS_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Where the search box goes on a page
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SearchBox {
+    /// In the header, out of the way, as on every listing page
+    Header,
+    /// In the body, the one thing on the page. The home page only.
+    Body,
+}
+
+/// The page shell, with the search box in the header
 fn page_with_search(title: &str, query: &str, focus: Focus, body: Markup) -> Markup {
+    shell(title, query, focus, SearchBox::Header, body)
+}
+
+/// The page shell. `search` decides whether the search box sits in the header or the body,
+/// so the home page can lead with it while every other page keeps it out of the way.
+fn shell(title: &str, query: &str, focus: Focus, search: SearchBox, body: Markup) -> Markup {
     html! {
         (DOCTYPE)
         html lang="en" {
@@ -376,7 +426,13 @@ fn page_with_search(title: &str, query: &str, focus: Focus, body: Markup) -> Mar
                 header {
                     a href="/" { "zerus" }
                     span.version { "v" (env!("CARGO_PKG_VERSION")) }
-                    (search_form(query, focus))
+                    a.nav href="/manifests" { "manifests" }
+                    @if uploads_enabled() {
+                        a.nav href="/uploads" { "uploads" }
+                    }
+                    @if search == SearchBox::Header {
+                        (search_form(query, focus))
+                    }
                 }
                 main { (body) }
                 script { (PreEscaped(SEARCH_SHORTCUT_JS)) }
@@ -396,6 +452,7 @@ header { border-bottom: 1px solid currentColor; margin-bottom: 1.5rem; padding-b
 header a { font-weight: bold; text-decoration: none; color: inherit; }
 header .version { margin-left: .5rem; font-size: .85em;
                   color: color-mix(in srgb, currentColor 65%, transparent); }
+header a.nav { margin-left: 1rem; font-weight: normal; text-decoration: underline; }
 table { border-collapse: collapse; width: 100%; }
 td, th { text-align: left; padding: .25rem .75rem .25rem 0; }
 th { border-bottom: 1px solid currentColor; }
@@ -411,6 +468,16 @@ a.sort { color: inherit; text-decoration: none; }
 a.sort:hover { text-decoration: underline; }
 a.sort.active::after { content: ' \\2193'; }
 form.search { display: inline; margin-left: 1rem; }
+/* The home page leads with the search box, so it is centred and given room. */
+.home { display: flex; justify-content: center; padding: 6rem 0; }
+.home form.search { display: flex; gap: .5rem; margin: 0; width: 100%; max-width: 32rem; }
+.home input[type=search] { flex: 1; min-width: 0; padding: .6rem; font-size: 1.1em; }
+.home button { font: inherit; padding: .6rem 1.2rem; }
+form.upload { margin: 1rem 0; }
+form.upload p { margin: .5rem 0; }
+form.upload label { display: inline-block; min-width: 8rem; }
+form.upload button { font: inherit; padding: .3rem 1rem; }
+p.failed { border-left: 3px solid currentColor; padding-left: .75rem; font-weight: bold; }
 ";
 
 // `s` and `/` focus the search box, the same keys docs.rs binds. Ctrl+S is left alone so
@@ -441,10 +508,10 @@ fn no_manifests_page() -> Markup {
                 "Start the server with "
                 code { "--manifests <DIR>" }
                 " to browse the manifest files written by "
-                code { "generate-manifest" }
+                code { "pack" }
                 "."
             }
-            pre { "zerus serve <mirror> --manifests transfers/" }
+            pre { "zerus serve <mirror> --manifests manifests/" }
         },
     )
 }
@@ -459,6 +526,19 @@ fn search_form(query: &str, focus: Focus) -> Markup {
             button type="submit" { "search" }
         }
     }
+}
+
+/// Home: the search box, and nothing to compete with it. Everything else is in the header.
+async fn home() -> Markup {
+    shell(
+        "zerus",
+        "",
+        Focus::Search,
+        SearchBox::Body,
+        html! {
+            div.home { (search_form("", Focus::Search)) }
+        },
+    )
 }
 
 /// Index: every manifest file with its crate count
@@ -625,33 +705,352 @@ async fn manifest_search(
     ))
 }
 
+#[derive(Serialize)]
+struct UploadResponse {
+    added: usize,
+    skipped: usize,
+    /// Crates the mirror gained, so the sender can confirm what landed
+    crates: Vec<String>,
+}
+
+/// The bearer token on a request, if it carries one
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+}
+
+/// Is `presented` the configured upload token?
+///
+/// A browser cannot set a header on a plain form post, so the upload page sends the token
+/// as a form field instead. Either source is accepted, and the whole value must match.
+fn authorized(state: &AppState, presented: Option<&str>) -> Result<(), StatusCode> {
+    // No token configured means uploads were never turned on.
+    let Some(expected) = state.upload_token.as_deref() else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let presented = presented.ok_or(StatusCode::UNAUTHORIZED)?;
+
+    if presented == expected {
+        Ok(())
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
+/// Accept a pack file, merge it into the mirror, and rebuild the index.
+///
+/// `serve` reads the index and crates from disk on every request, so the merge is visible
+/// to clients as soon as it finishes; the server needs no restart.
+async fn upload(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> Result<Response, StatusCode> {
+    // A browser form asks for the result as a page; curl and scripts get JSON.
+    let wants_html = headers
+        .get(ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("text/html"));
+
+    match run_upload(&state, &headers, multipart).await {
+        Ok(summary) => Ok(upload_result(summary, wants_html)),
+        // A form post shows the failure on the page, so the user can correct the token
+        // and try again rather than land on a bare status code.
+        Err(status) if wants_html && status != StatusCode::NOT_FOUND => {
+            Ok(upload_page(&state, Some(status)).into_response())
+        }
+        Err(status) => Err(status),
+    }
+}
+
+/// Read the multipart body, check the token, and merge the pack
+async fn run_upload(
+    state: &AppState,
+    headers: &HeaderMap,
+    mut multipart: Multipart,
+) -> Result<crate::pack::MergeSummary, StatusCode> {
+    // Reject a bad bearer token before reading the body, so an unauthorized client cannot
+    // push a large upload through. A form post has no header, so its token is checked after
+    // the fields arrive.
+    if let Some(presented) = bearer(headers) {
+        authorized(state, Some(presented))?;
+    } else if state.upload_token.is_none() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let mut body = None;
+    let mut name = String::from("upload");
+    let mut form_token = None;
+    while let Some(field) = multipart.next_field().await.map_err(|e| {
+        warn!("failed to read upload: {e}");
+        StatusCode::BAD_REQUEST
+    })? {
+        match field.name() {
+            Some("token") => {
+                form_token = field.text().await.ok();
+            }
+            Some("pack") => {
+                if let Some(filename) = field.file_name() {
+                    name = filename.to_string();
+                }
+                body = Some(field.bytes().await.map_err(|e| {
+                    warn!("failed to read upload body: {e}");
+                    StatusCode::BAD_REQUEST
+                })?);
+            }
+            _ => continue,
+        }
+    }
+
+    // Checked after the body is read: the fields arrive in whatever order the form sends,
+    // and the token may come after the file.
+    authorized(
+        state,
+        bearer(headers).or(form_token.as_deref().filter(|t| !t.is_empty())),
+    )?;
+
+    let Some(body) = body else {
+        warn!("upload had no `pack` field");
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    if body.is_empty() {
+        warn!("upload had an empty `pack` field");
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // backhand seeks over the image, so the upload lands in a temporary file first.
+    let temp = tempfile::NamedTempFile::new().map_err(|e| {
+        warn!("failed to create temp file: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    std::fs::write(temp.path(), &body).map_err(|e| {
+        warn!("failed to buffer upload: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let mirror_path = state.mirror_path.clone();
+    let dl_url = state.dl_url.clone();
+    let temp_path = temp.path().to_path_buf();
+    let manifests_path = state.manifests_path.clone();
+    let pack_name = name.clone();
+
+    // Merging and indexing are blocking and can take a while on a big pack, so they run
+    // off the async runtime's worker threads.
+    let summary = tokio::task::spawn_blocking(move || {
+        let summary = crate::pack::merge(&temp_path, &mirror_path)?;
+
+        // The pack carries its own manifest, so an upload leaves the same record here that
+        // the sending side kept. Without a manifests dir there is nowhere to put it, and
+        // the crates show up under the un-manifested view instead.
+        if let Some(dir) = &manifests_path {
+            crate::pack::record_merge(dir, &pack_name, &summary)?;
+        }
+
+        if summary.changed() {
+            crate::index::update_index(
+                &mirror_path.join("crates.io-index"),
+                &mirror_path.join("crates"),
+                dl_url.as_deref(),
+            )?;
+        }
+        Ok::<_, anyhow::Error>(summary)
+    })
+    .await
+    .map_err(|e| {
+        warn!("upload task failed: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .map_err(|e| {
+        warn!("failed to merge upload: {e:#}");
+        StatusCode::BAD_REQUEST
+    })?;
+
+    info!(
+        "upload {name}: added {} crate(s), skipped {}",
+        summary.added.len(),
+        summary.skipped.len()
+    );
+
+    if let Ok(mut uploads) = state.uploads.lock() {
+        uploads.insert(
+            0,
+            Upload {
+                name,
+                added: summary.added.len(),
+                skipped: summary.skipped.len(),
+                at: SystemTime::now(),
+            },
+        );
+        uploads.truncate(UPLOAD_HISTORY);
+    }
+
+    Ok(summary)
+}
+
+/// Render a finished upload as a page for a browser, or JSON for everything else
+fn upload_result(summary: crate::pack::MergeSummary, wants_html: bool) -> Response {
+    if !wants_html {
+        return Json(UploadResponse {
+            added: summary.added.len(),
+            skipped: summary.skipped.len(),
+            crates: summary
+                .added
+                .iter()
+                .map(|c| format!("{}@{}", c.name, c.version))
+                .collect(),
+        })
+        .into_response();
+    }
+
+    page(
+        "upload - zerus",
+        html! {
+            h1 { "Upload complete" }
+            p.count {
+                (summary.added.len()) " crate(s) added, "
+                (summary.skipped.len()) " already in the mirror"
+            }
+            @if summary.added.is_empty() {
+                p.empty { "The mirror already held every crate in this pack." }
+            } @else {
+                table {
+                    thead { tr { th { "crate" } th { "version" } } }
+                    tbody {
+                        @for c in &summary.added {
+                            tr { td { (c.name) } td { (c.version) } }
+                        }
+                    }
+                }
+            }
+            p { a href="/uploads" { "back to uploads" } }
+        },
+    )
+    .into_response()
+}
+
+/// Send a pack from the browser, over the history of what has come in already.
+/// `failed` renders the message for an upload that was just refused.
+fn upload_page(state: &AppState, failed: Option<StatusCode>) -> Markup {
+    let uploads = state.uploads.lock().ok();
+
+    page(
+        "uploads - zerus",
+        html! {
+            h1 { "Uploads" }
+            @if state.upload_token.is_none() {
+                p.empty {
+                    "Uploads are off. Start the server with "
+                    code { "--upload-token <TOKEN>" } " to accept them."
+                }
+            } @else {
+                @if let Some(status) = failed {
+                    p.failed {
+                        @match status {
+                            StatusCode::UNAUTHORIZED => "Wrong or missing token.",
+                            StatusCode::BAD_REQUEST => "That file is not a zerus pack, or no file was chosen.",
+                            _ => "The upload failed. Check the server log.",
+                        }
+                    }
+                }
+                form.upload action="/admin/upload" method="post" enctype="multipart/form-data" {
+                    p {
+                        label for="pack" { "Pack file" }
+                        input #pack type="file" name="pack" accept=".zpk" required;
+                    }
+                    p {
+                        label for="token" { "Upload token" }
+                        input #token type="password" name="token" required;
+                    }
+                    button type="submit" { "upload" }
+                }
+                p.empty {
+                    "The pack is merged into the mirror and the index is updated. Crates the "
+                    "mirror already holds are left alone."
+                }
+
+                h2 { "History" }
+                @match uploads.as_ref().map(|u| u.as_slice()) {
+                    Some([]) | None => p.empty { "No uploads since the server started." },
+                    Some(uploads) => {
+                        p.count { (uploads.len()) " upload(s) since the server started" }
+                        table {
+                            thead {
+                                tr { th { "pack" } th { "added" } th { "already had" } th { "when" } }
+                            }
+                            tbody {
+                                @for u in uploads {
+                                    tr {
+                                        td { (u.name) }
+                                        td.count { (u.added) }
+                                        td.count { (u.skipped) }
+                                        td.count { (format_time(u.at)) }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    )
+}
+
+/// The uploads this server has accepted since it started, with the form to add another
+async fn uploads_page(State(state): State<Arc<AppState>>) -> Markup {
+    upload_page(&state, None)
+}
+
 fn router(state: Arc<AppState>) -> Router {
     Router::new()
-        .route("/", get(manifests_index))
+        .route("/", get(home))
+        .route("/manifests", get(manifests_index))
         .route("/manifests/{name}", get(manifest_detail))
         .route("/unmanifested", get(unmanifested))
+        .route("/uploads", get(uploads_page))
         .route("/search", get(manifest_search))
         .route("/api/v1/crates", get(search))
         .route("/crates/{*path}", get(serve_crate_file))
         .route("/crates.io-index/{*path}", get(serve_index_file))
+        .route(
+            "/admin/upload",
+            post(upload).layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES)),
+        )
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
 
-pub fn serve(
-    mirror_path: PathBuf,
-    bind: String,
-    manifests_path: Option<PathBuf>,
-) -> anyhow::Result<()> {
+/// How to run the server
+pub struct Config {
+    pub mirror_path: PathBuf,
+    pub bind: String,
+    pub manifests_path: Option<PathBuf>,
+    pub upload_token: Option<String>,
+    pub dl_url: Option<String>,
+}
+
+pub fn serve(config: Config) -> anyhow::Result<()> {
+    let uploads_on = config.upload_token.is_some();
+    UPLOADS_ENABLED.store(uploads_on, Ordering::Relaxed);
+    let bind = config.bind;
     let app = router(Arc::new(AppState {
-        mirror_path,
-        manifests_path,
+        mirror_path: config.mirror_path,
+        manifests_path: config.manifests_path,
+        upload_token: config.upload_token,
+        dl_url: config.dl_url,
+        uploads: Mutex::new(Vec::new()),
     }));
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let listener = tokio::net::TcpListener::bind(&bind).await?;
         info!("serving on http://{bind}");
+        if uploads_on {
+            // Say this plainly at startup: the endpoint writes to the mirror, and a bearer
+            // token over plain HTTP is only as private as the network it crosses.
+            info!("pack uploads accepted at POST /admin/upload (bearer token required)");
+        }
         axum::serve(listener, app).await?;
         Ok::<_, anyhow::Error>(())
     })?;
