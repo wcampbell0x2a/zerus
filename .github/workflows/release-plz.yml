@@ -35,7 +35,7 @@ jobs:
           target: x86_64-unknown-linux-gnu
       - name: Run release-plz
         id: release-plz
-        uses: release-plz/action@aec534bbd8631793b9b3b8f1ee6cd886c322e17f # v0.5.133
+        uses: release-plz/action@a80d79efe0a195618acb02a4089d55fe74d2505f # v0.5.136
         with:
           command: release
         env:
@@ -63,7 +63,7 @@ jobs:
           toolchain: stable
           target: x86_64-unknown-linux-gnu
       - name: Run release-plz
-        uses: release-plz/action@aec534bbd8631793b9b3b8f1ee6cd886c322e17f # v0.5.133
+        uses: release-plz/action@a80d79efe0a195618acb02a4089d55fe74d2505f # v0.5.136
         with:
           command: release-pr
         env:
