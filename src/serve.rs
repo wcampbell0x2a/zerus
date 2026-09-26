@@ -709,12 +709,46 @@ async fn manifest_search(
     ))
 }
 
-#[derive(Serialize)]
-struct UploadResponse {
-    added: usize,
-    skipped: usize,
+/// The JSON answer to an accepted upload. `zerus upload` reads it back.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct UploadResponse {
+    pub added: usize,
+    pub skipped: usize,
     /// Crates the mirror gained, so the sender can confirm what landed
-    crates: Vec<String>,
+    pub crates: Vec<String>,
+}
+
+/// The JSON answer to a refused upload that has a reason to give
+#[derive(Serialize, Deserialize, Debug)]
+pub struct UploadRefusal {
+    pub error: String,
+}
+
+/// Why an upload was refused.
+///
+/// Most refusals have a status that tells the client all it needs. A pack that fails its
+/// checks also carries the reason, because the sender cannot see the server log.
+struct Refusal {
+    status: StatusCode,
+    reason: Option<String>,
+}
+
+impl From<StatusCode> for Refusal {
+    fn from(status: StatusCode) -> Self {
+        Self {
+            status,
+            reason: None,
+        }
+    }
+}
+
+impl IntoResponse for Refusal {
+    fn into_response(self) -> Response {
+        match self.reason {
+            Some(error) => (self.status, Json(UploadRefusal { error })).into_response(),
+            None => self.status.into_response(),
+        }
+    }
 }
 
 /// The bearer token on a request, if it carries one
@@ -764,7 +798,7 @@ async fn upload(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     multipart: Multipart,
-) -> Result<Response, StatusCode> {
+) -> Response {
     // A browser form asks for the result as a page; curl and scripts get JSON.
     let wants_html = headers
         .get(ACCEPT)
@@ -772,13 +806,13 @@ async fn upload(
         .is_some_and(|v| v.contains("text/html"));
 
     match run_upload(&state, &headers, multipart).await {
-        Ok(summary) => Ok(upload_result(summary, wants_html)),
+        Ok(summary) => upload_result(summary, wants_html),
         // A form post shows the failure on the page, so the user can correct the token
         // and try again rather than land on a bare status code.
-        Err(status) if wants_html && status != StatusCode::NOT_FOUND => {
-            Ok(upload_page(&state, Some(status)).into_response())
+        Err(refusal) if wants_html && refusal.status != StatusCode::NOT_FOUND => {
+            upload_page(&state, Some(refusal.status)).into_response()
         }
-        Err(status) => Err(status),
+        Err(refusal) => refusal.into_response(),
     }
 }
 
@@ -791,10 +825,10 @@ async fn run_upload(
     state: &AppState,
     headers: &HeaderMap,
     mut multipart: Multipart,
-) -> Result<crate::pack::MergeSummary, StatusCode> {
+) -> Result<crate::pack::MergeSummary, Refusal> {
     // No token configured means uploads were never turned on.
     let Some(expected) = state.upload_token.as_deref() else {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(StatusCode::NOT_FOUND.into());
     };
     let mut auth = match bearer(headers) {
         Some(presented) => check_token(expected, presented.as_bytes())?,
@@ -815,7 +849,7 @@ async fn run_upload(
             Some("pack") => {
                 if auth == Auth::Pending {
                     warn!("refused upload: the pack came before a token");
-                    return Err(StatusCode::UNAUTHORIZED);
+                    return Err(StatusCode::UNAUTHORIZED.into());
                 }
                 if let Some(filename) = field.file_name() {
                     name = filename.to_string();
@@ -827,11 +861,14 @@ async fn run_upload(
     }
 
     if auth == Auth::Pending {
-        return Err(StatusCode::UNAUTHORIZED);
+        return Err(StatusCode::UNAUTHORIZED.into());
     }
     let Some(temp) = received else {
         warn!("upload had no `pack` field");
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(Refusal {
+            status: StatusCode::BAD_REQUEST,
+            reason: Some(String::from("the upload has no `pack` field")),
+        });
     };
 
     let mirror_path = state.mirror_path.clone();
@@ -853,7 +890,13 @@ async fn run_upload(
         // it was.
         let summary = crate::pack::merge(&temp_path, &mirror_path).map_err(|e| {
             warn!("refused upload {pack_name}: {e:#}");
-            StatusCode::BAD_REQUEST
+            // The client knows the pack by its own name, not by the server's temporary
+            // file, and the server's paths are not the client's business.
+            let reason = format!("{e:#}").replace(&temp_path.display().to_string(), &pack_name);
+            Refusal {
+                status: StatusCode::BAD_REQUEST,
+                reason: Some(reason),
+            }
         })?;
 
         // A failure from here on is the server's: the crates passed every check.
@@ -875,15 +918,15 @@ async fn run_upload(
         };
         finish().map_err(|e| {
             warn!("failed to finish upload {pack_name}: {e:#}");
-            StatusCode::INTERNAL_SERVER_ERROR
+            Refusal::from(StatusCode::INTERNAL_SERVER_ERROR)
         })?;
 
-        Ok::<_, StatusCode>(summary)
+        Ok::<_, Refusal>(summary)
     })
     .await
     .map_err(|e| {
         warn!("upload task failed: {e}");
-        StatusCode::INTERNAL_SERVER_ERROR
+        Refusal::from(StatusCode::INTERNAL_SERVER_ERROR)
     })??;
     drop(temp);
 

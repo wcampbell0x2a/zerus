@@ -31,9 +31,12 @@ $ zerus serve /mirror --manifests /mirror/manifests \
       --upload-token "$TOKEN" --dl-url http://[IP]
 ```
 
-Carry the `.zpk` across, then open `http://[IP]/uploads` in a browser and send it with the
-form. The crates merge into the mirror, the index is rebuilt, and `cargo` sees them without
-a restart.
+Carry the `.zpk` across, then send it with `zerus upload`, or open `http://[IP]/uploads` in
+a browser and use the form. The crates merge into the mirror, the index is rebuilt, and
+`cargo` sees them without a restart.
+```console
+$ zerus upload transfers/2026-09-06.zpk --url http://[IP] --token "$TOKEN"
+```
 
 ### Pack a transfer
 `zerus pack` downloads your dependencies, leaves out what earlier transfers already carried,
@@ -102,21 +105,35 @@ $ zerus serve new-mirror --manifests manifests/
 ```
 
 #### Upload packs to a running server
-Give `serve` an upload token to accept packs at `/uploads` in the browser, or at
-`POST /admin/upload` for scripts. An upload merges into the mirror and updates the index, and
-the server reads both from disk on each request, so new crates resolve without a restart.
+Give `serve` an upload token to accept packs with `zerus upload`, at `/uploads` in the
+browser, or at `POST /admin/upload` for scripts. An upload merges into the mirror and updates
+the index, and the server reads both from disk on each request, so new crates resolve without
+a restart.
 ```console
 $ zerus serve /mirror --manifests /mirror/manifests \
       --upload-token "$TOKEN" --dl-url http://[IP]
+$ zerus upload transfers/2026-09-06.zpk --url http://[IP] --token "$TOKEN"
+  sending transfers/2026-09-06.zpk (5 crate(s)) to http://[IP]/admin/upload
+  added 2 crate(s), skipped 3 already in the mirror
+```
+`zerus upload` reads the pack before it sends it, so a wrong file fails at once. It streams
+the file with a progress bar, and it has no time limit, because a big pack and the index
+rebuild after it can take minutes. If the server refuses the pack, it shows the reason.
+Pass `--verbose` to list the crates the mirror gained.
+
+Without zerus on the sending machine, use `curl`:
+```console
 $ curl -X POST -H "Authorization: Bearer $TOKEN" \
       -F pack=@transfers/2026-09-06.zpk http://[IP]/admin/upload
 {"added":2,"skipped":3,"crates":["phf@0.9.0","png@0.17.16"]}
 ```
+A refused pack comes back as `{"error": "..."}` with the reason.
 `--dl-url` is required with `--upload-token`, unless the mirror already has a
 `crates.io-index/config.json` from an earlier run. Without it, cargo cannot use the crates
 that an upload adds, so the server does not start.
 
-The token can come from `ZERUS_UPLOAD_TOKEN` instead of the command line. In the browser, the
+For both `serve` and `upload`, the token can come from `ZERUS_UPLOAD_TOKEN` instead of the
+command line. In the browser, the
 `/uploads` page takes the pack file and the token in a form, reports what the merge added,
 and lists the uploads the server has accepted since it started. A browser gets a page back;
 `curl` and scripts get the JSON above.
