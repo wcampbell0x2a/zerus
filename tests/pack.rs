@@ -1103,3 +1103,52 @@ fn pack_leaves_out_the_projects_own_crates() {
         "tried to download a local crate: {stderr}"
     );
 }
+
+/// Cargo asks for index files by the lowercased crate name, but downloads the crate by its
+/// real name. A crate such as `Inflector` needs both to resolve.
+#[test]
+fn a_crate_with_capitals_resolves_by_the_paths_cargo_asks_for() {
+    let src = TempDir::new().unwrap();
+    write_crate_file(src.path(), "Inflector", "0.11.4");
+    let pack = src.path().join("transfer.zpk");
+    pack_everything(src.path(), &pack);
+
+    let dest = TempDir::new().unwrap();
+    let out = zerus()
+        .args([
+            "unpack",
+            dest.path().to_str().unwrap(),
+            pack.to_str().unwrap(),
+            "--no-record",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "unpack failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let port = 18096;
+    let _server = start_server(dest.path(), port, None);
+
+    let entry = reqwest::blocking::get(format!(
+        "http://127.0.0.1:{port}/crates.io-index/in/fl/inflector"
+    ))
+    .unwrap();
+    assert_eq!(entry.status(), 200, "index not at the lowercase path");
+    assert!(
+        entry.text().unwrap().contains("\"name\":\"Inflector\""),
+        "the entry lost the real name"
+    );
+
+    let download = reqwest::blocking::get(format!(
+        "http://127.0.0.1:{port}/crates/In/fl/Inflector/0.11.4/Inflector-0.11.4.crate"
+    ))
+    .unwrap();
+    assert_eq!(
+        download.status(),
+        200,
+        "crate not at the path cargo downloads"
+    );
+}

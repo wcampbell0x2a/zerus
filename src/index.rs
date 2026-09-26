@@ -266,8 +266,11 @@ fn collect_deps(
 
 pub fn write_index_entries(index_path: &Path, new_entries: &[IndexEntry]) -> anyhow::Result<()> {
     let first = &new_entries[0];
-    let prefix = get_index_prefix(&first.name).context("invalid crate name for index prefix")?;
-    let index_file = index_path.join(prefix).join(&first.name);
+    // Cargo asks for index files by the lowercased name (`Inflector` is `in/fl/inflector`),
+    // though it downloads the crate by its real name. The entries keep the real name.
+    let file_name = first.name.to_lowercase();
+    let prefix = get_index_prefix(&file_name).context("invalid crate name for index prefix")?;
+    let index_file = index_path.join(prefix).join(&file_name);
 
     let mut entries: Vec<IndexEntry> = if index_file.exists() {
         let contents = fs::read_to_string(&index_file)
