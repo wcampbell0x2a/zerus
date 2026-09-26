@@ -1152,3 +1152,153 @@ fn a_crate_with_capitals_resolves_by_the_paths_cargo_asks_for() {
         "crate not at the path cargo downloads"
     );
 }
+
+/// Run `zerus upload` and return whether it succeeded, with its log
+fn upload_cli(pack: &Path, port: u16, token: &str) -> (bool, String) {
+    let out = zerus()
+        .args([
+            "upload",
+            pack.to_str().unwrap(),
+            "--url",
+            &format!("http://127.0.0.1:{port}"),
+            "--token",
+            token,
+        ])
+        .output()
+        .unwrap();
+
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// A mirror with one crate, and a pack of it
+fn one_crate_pack() -> (TempDir, std::path::PathBuf) {
+    let src = TempDir::new().unwrap();
+    write_crate_file(src.path(), "serde", "1.0.210");
+    let pack = src.path().join("transfer.zpk");
+    pack_everything(src.path(), &pack);
+    (src, pack)
+}
+
+#[test]
+fn the_upload_command_lands_the_crates_and_reports_them() {
+    let (_src, pack) = one_crate_pack();
+    let dest = TempDir::new().unwrap();
+    let port = 18110;
+    let _server = start_server(dest.path(), port, Some("s3cret"));
+
+    let (ok, log) = upload_cli(&pack, port, "s3cret");
+
+    assert!(ok, "upload failed: {log}");
+    assert!(log.contains("added 1 crate(s), skipped 0"), "{log}");
+    assert!(dest
+        .path()
+        .join("crates/se/rd/serde/1.0.210/serde-1.0.210.crate")
+        .is_file());
+
+    // Again: nothing to add, and still a success.
+    let (ok, log) = upload_cli(&pack, port, "s3cret");
+    assert!(ok, "re-upload failed: {log}");
+    assert!(log.contains("added 0 crate(s), skipped 1"), "{log}");
+}
+
+#[test]
+fn the_upload_command_takes_the_token_from_the_environment() {
+    let (_src, pack) = one_crate_pack();
+    let dest = TempDir::new().unwrap();
+    let port = 18111;
+    let _server = start_server(dest.path(), port, Some("s3cret"));
+
+    let out = zerus()
+        .env("ZERUS_UPLOAD_TOKEN", "s3cret")
+        .args([
+            "upload",
+            pack.to_str().unwrap(),
+            "--url",
+            &format!("http://127.0.0.1:{port}/"),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "upload failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn the_upload_command_reports_a_wrong_token() {
+    let (_src, pack) = one_crate_pack();
+    let dest = TempDir::new().unwrap();
+    let port = 18112;
+    let _server = start_server(dest.path(), port, Some("s3cret"));
+
+    let (ok, log) = upload_cli(&pack, port, "wrong");
+
+    assert!(!ok, "upload with a wrong token succeeded");
+    assert!(log.contains("refused the token"), "{log}");
+}
+
+#[test]
+fn the_upload_command_reports_a_server_without_uploads() {
+    let (_src, pack) = one_crate_pack();
+    let dest = TempDir::new().unwrap();
+    let port = 18113;
+    let _server = start_server(dest.path(), port, None);
+
+    let (ok, log) = upload_cli(&pack, port, "s3cret");
+
+    assert!(!ok);
+    assert!(log.contains("does not accept uploads"), "{log}");
+}
+
+#[test]
+fn the_upload_command_reports_a_server_that_is_not_there() {
+    let (_src, pack) = one_crate_pack();
+
+    // Nothing listens on this port.
+    let (ok, log) = upload_cli(&pack, 18114, "s3cret");
+
+    assert!(!ok);
+    assert!(log.contains("failed to send the pack"), "{log}");
+}
+
+#[test]
+fn the_upload_command_shows_why_the_server_refused_a_pack() {
+    let bad_src = TempDir::new().unwrap();
+    let dir = bad_src.path().join("crates/ev/il/evil/1.0.0");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("evil-1.0.0.crate"), b"not a crate").unwrap();
+    let pack = bad_src.path().join("bad.zpk");
+    pack_everything(bad_src.path(), &pack);
+
+    let dest = TempDir::new().unwrap();
+    let port = 18115;
+    let _server = start_server(dest.path(), port, Some("s3cret"));
+
+    let (ok, log) = upload_cli(&pack, port, "s3cret");
+
+    assert!(!ok);
+    assert!(
+        log.contains("evil@1.0.0 is not a valid .crate file"),
+        "{log}"
+    );
+    // The reason names the pack as the client knows it, not the server's temporary file.
+    assert!(!log.contains(".upload-"), "leaked a server path: {log}");
+}
+
+#[test]
+fn the_upload_command_checks_the_file_before_it_sends_anything() {
+    let tmp = TempDir::new().unwrap();
+    let bogus = tmp.path().join("notes.zpk");
+    fs::write(&bogus, b"not a pack").unwrap();
+
+    // No server at all: the command must fail on the file, not on the connection.
+    let (ok, log) = upload_cli(&bogus, 18116, "s3cret");
+
+    assert!(!ok);
+    assert!(log.contains("not a zerus pack file"), "{log}");
+}

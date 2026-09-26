@@ -18,6 +18,7 @@ mod manifest;
 mod mirror;
 mod pack;
 mod serve;
+mod upload;
 
 fn validate_url(url: &str) -> Result<String, String> {
     if url.starts_with("http://") || url.starts_with("https://") {
@@ -199,6 +200,25 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Send a pack file to a running `zerus serve`, which merges it into its mirror
+    Upload {
+        /// Pack file to send
+        pack: PathBuf,
+
+        /// Address of the server (e.g. http://mirror:8080)
+        #[arg(long)]
+        #[arg(value_hint = ValueHint::Url, value_parser = validate_url)]
+        url: String,
+
+        /// The upload token the server was started with
+        #[arg(
+            long,
+            value_name = "TOKEN",
+            env = "ZERUS_UPLOAD_TOKEN",
+            hide_env_values = true
+        )]
+        token: String,
+    },
     /// Serve crate registry with sparse index, downloads, and search
     Serve {
         /// Path to mirror directory
@@ -361,6 +381,9 @@ fn run() -> anyhow::Result<()> {
                 manifests,
                 dry_run,
             })?;
+        }
+        Command::Upload { pack, url, token } => {
+            upload::upload(&pack, &url, &token)?;
         }
         Command::Serve {
             mirror_path,
