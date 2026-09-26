@@ -1061,3 +1061,45 @@ fn a_full_day_of_default_pack_names_is_an_error_not_an_overwrite() {
         "the first pack of the day was overwritten"
     );
 }
+
+/// A project's own crates, and its path dependencies, are not on crates.io. `pack` used to
+/// try to download them, fail, and write no pack at all.
+#[test]
+fn pack_leaves_out_the_projects_own_crates() {
+    let work = TempDir::new().unwrap();
+    let project = work.path().join("app");
+    let helper = work.path().join("helper");
+    for (dir, manifest) in [
+        (
+            &project,
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\nhelper = { path = \"../helper\" }\n",
+        ),
+        (
+            &helper,
+            "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        ),
+    ] {
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("Cargo.toml"), manifest).unwrap();
+        fs::write(dir.join("src/lib.rs"), "").unwrap();
+    }
+
+    let out = zerus()
+        .current_dir(work.path())
+        .args([
+            "pack",
+            "mirror",
+            project.join("Cargo.toml").to_str().unwrap(),
+            "--no-record",
+        ])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "pack failed: {stderr}");
+    assert!(
+        !stderr.contains("not hosted on crates.io"),
+        "tried to download a local crate: {stderr}"
+    );
+}
