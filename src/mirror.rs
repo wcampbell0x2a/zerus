@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{bail, Context};
 use guppy::errors::Error::CommandError;
+use guppy::graph::PackageSource;
 use guppy::MetadataCommand;
 use indicatif::ProgressStyle;
 use rayon::prelude::*;
@@ -168,7 +169,29 @@ fn get_deps(
             }
         };
 
-        for package in package_graph.packages() {
+        // guppy gives the packages in hash order. Sort them, so that the log is the same on
+        // each run.
+        let mut packages: Vec<_> = package_graph.packages().collect();
+        packages.sort_by(|a, b| (a.name(), a.version()).cmp(&(b.name(), b.version())));
+        for package in packages {
+            match Origin::of(&package.source()) {
+                Origin::CratesIo => {}
+                // The project's own crates travel with its source, not through the mirror.
+                Origin::Local => {
+                    debug!("skipping {} {}: local", package.name(), package.version());
+                    continue;
+                }
+                Origin::Elsewhere => {
+                    warn!(
+                        "skipping {} {} from {}: only crates.io crates can be mirrored, so an \
+                         offline build must get it another way",
+                        package.name(),
+                        package.version(),
+                        package.source()
+                    );
+                    continue;
+                }
+            }
             let c = Crate::new(package.name().to_string(), package.version().to_string());
             if !crates.contains(&c) {
                 crates.push(c);
@@ -178,6 +201,34 @@ fn get_deps(
     }
 
     Some(ret)
+}
+
+/// The source of a package, from `cargo metadata`, in the groups that the mirror uses
+#[derive(Debug, PartialEq, Eq)]
+enum Origin {
+    /// crates.io, by either index protocol, so the mirror can download it
+    CratesIo,
+    /// A workspace member or path dependency
+    Local,
+    /// A git repository or another registry, which the mirror cannot download
+    Elsewhere,
+}
+
+impl Origin {
+    /// The sparse protocol address of crates.io. guppy's `is_crates_io` only knows the git
+    /// address, which is what Cargo.lock records by default.
+    const CRATES_IO_SPARSE: &'static str = "sparse+https://index.crates.io";
+
+    fn of(source: &PackageSource) -> Self {
+        match source {
+            PackageSource::Workspace(_) | PackageSource::Path(_) => Self::Local,
+            _ if source.is_crates_io() => Self::CratesIo,
+            PackageSource::External(s) if s.trim_end_matches('/') == Self::CRATES_IO_SPARSE => {
+                Self::CratesIo
+            }
+            PackageSource::External(_) => Self::Elsewhere,
+        }
+    }
 }
 
 /// A single version entry from the crates.io sparse index
@@ -515,4 +566,40 @@ pub fn mirror(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crates_io_is_recognized_by_either_index_protocol() {
+        for source in [
+            PackageSource::CRATES_IO_REGISTRY,
+            "sparse+https://index.crates.io",
+            "sparse+https://index.crates.io/",
+        ] {
+            assert_eq!(
+                Origin::of(&PackageSource::External(source)),
+                Origin::CratesIo,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_and_other_registries_are_elsewhere() {
+        for source in [
+            "git+https://github.com/serde-rs/serde?branch=master#abc123",
+            "registry+https://example.com/index",
+            "sparse+https://example.com/index/",
+            "sparse+https://index.crates.io.example.com",
+        ] {
+            assert_eq!(
+                Origin::of(&PackageSource::External(source)),
+                Origin::Elsewhere,
+                "{source}"
+            );
+        }
+    }
 }
