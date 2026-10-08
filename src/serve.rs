@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -9,6 +10,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use maud::{html, Markup, PreEscaped, DOCTYPE};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use time::macros::format_description;
 use time::OffsetDateTime;
@@ -214,7 +216,7 @@ fn format_time(time: SystemTime) -> String {
 }
 
 /// Column a crate listing is ordered by
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Sort {
     Name,
     Written,
@@ -228,13 +230,52 @@ impl Sort {
             Self::Written => "written",
         }
     }
+}
 
-    fn parse(value: &str) -> Option<Self> {
+impl FromStr for Sort {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
         [Self::Name, Self::Written]
             .into_iter()
             .find(|sort| sort.param() == value)
+            .ok_or(())
     }
 }
+
+/// The part of a manifest's crates that a detail page lists
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Show {
+    /// Crates still in the mirror, which have yet to make the trip
+    Present,
+    /// Crates already transferred and removed from the mirror
+    Culled,
+}
+
+impl Show {
+    /// The `show=` value that asks for this part
+    fn param(self) -> &'static str {
+        match self {
+            Self::Present => "present",
+            Self::Culled => "culled",
+        }
+    }
+}
+
+impl FromStr for Show {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        [Self::Present, Self::Culled]
+            .into_iter()
+            .find(|show| show.param() == value)
+            .ok_or(())
+    }
+}
+
+/// The most rows one page lists. A manifest can hold hundreds of thousands of crates,
+/// and a table that large takes a browser a long time to lay out.
+const PAGE_SIZE: usize = 1000;
 
 /// A crate in a listing, paired with the write time of its `.crate` file.
 /// `written` is `None` for a culled crate, which no longer has a file to stat.
@@ -252,8 +293,9 @@ impl Listed<'_> {
 /// Pair each crate with its write time and order the result by `sort`.
 /// Newest first when sorting by write time; culled crates have no time, so they sort last.
 fn listing<'a>(mirror_path: &Path, crates: &'a [Crate], sort: Sort) -> Vec<Listed<'a>> {
+    // One stat per crate. On a slow disk this is the cost of the page, so do them in parallel.
     let mut listed: Vec<Listed<'a>> = crates
-        .iter()
+        .par_iter()
         .map(|krate| Listed {
             krate,
             written: written_at(mirror_path, &krate.name, &krate.version),
@@ -261,9 +303,9 @@ fn listing<'a>(mirror_path: &Path, crates: &'a [Crate], sort: Sort) -> Vec<Liste
         .collect();
 
     match sort {
-        Sort::Name => listed.sort_by(|a, b| a.krate.cmp(b.krate)),
+        Sort::Name => listed.par_sort_by(|a, b| a.krate.cmp(b.krate)),
         Sort::Written => {
-            listed.sort_by(|a, b| b.written.cmp(&a.written).then_with(|| a.krate.cmp(b.krate)))
+            listed.par_sort_by(|a, b| b.written.cmp(&a.written).then_with(|| a.krate.cmp(b.krate)))
         }
     }
 
@@ -276,42 +318,126 @@ fn split_culled<'a, 'b>(listed: &'b [Listed<'a>]) -> (Vec<&'b Listed<'a>>, Vec<&
     listed.iter().partition(|l| l.in_mirror())
 }
 
-#[derive(serde::Deserialize)]
-struct SortParams {
-    /// `None` for both a missing and an unrecognized `sort=`, so a hand-edited URL
-    /// falls back to the default order instead of failing the request
-    #[serde(default, deserialize_with = "ignore_unknown_sort")]
-    sort: Option<Sort>,
+/// One page of a listing
+#[derive(Debug, PartialEq, Eq)]
+struct Page<'a, T> {
+    rows: &'a [T],
+    /// 1-based
+    number: usize,
+    /// Never 0: an empty listing still has one, empty, page
+    count: usize,
 }
 
-fn ignore_unknown_sort<'de, D>(deserializer: D) -> Result<Option<Sort>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let raw = Option::<String>::deserialize(deserializer)?;
-    Ok(raw.as_deref().and_then(Sort::parse))
-}
+/// Cut page `requested` out of `rows`. A page number out of range gives the nearest page,
+/// so a stale link still shows something after the listing shrinks.
+fn paginate<T>(rows: &[T], requested: usize) -> Page<'_, T> {
+    let count = rows.len().div_ceil(PAGE_SIZE).max(1);
+    let number = requested.clamp(1, count);
+    let start = (number - 1) * PAGE_SIZE;
+    let end = (start + PAGE_SIZE).min(rows.len());
 
-impl SortParams {
-    fn sort(&self) -> Sort {
-        self.sort.unwrap_or(Sort::Name)
+    Page {
+        rows: &rows[start..end],
+        number,
+        count,
     }
 }
 
-/// A crate table with sortable `crate` and `written` column headers.
-/// `base` is the path the header links point back at, e.g. `/manifests/2026-08-13.txt`.
-fn crate_table(listed: &[&Listed<'_>], base: &str, sort: Sort) -> Markup {
+/// The query of a crate listing page.
+/// Each field is `None` for both a missing and an unrecognized value, so a hand-edited URL
+/// falls back to the default instead of failing the request.
+#[derive(Debug, Default, serde::Deserialize)]
+struct ListParams {
+    #[serde(default, deserialize_with = "ignore_invalid")]
+    sort: Option<Sort>,
+    #[serde(default, deserialize_with = "ignore_invalid")]
+    show: Option<Show>,
+    #[serde(default, deserialize_with = "ignore_invalid")]
+    page: Option<usize>,
+}
+
+fn ignore_invalid<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: FromStr,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    Ok(raw.as_deref().and_then(|value| value.parse().ok()))
+}
+
+impl ListParams {
+    /// The view these params ask for, of the listing at `base`
+    fn view(self, base: &str) -> View<'_> {
+        View {
+            base,
+            sort: self.sort.unwrap_or(Sort::Name),
+            show: self.show.unwrap_or(Show::Present),
+            page: self.page.unwrap_or(1),
+        }
+    }
+}
+
+/// Everything that picks what a listing page shows. Links on the page change one field and
+/// keep the others, so sorting does not lose the culled view and paging does not lose the order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct View<'a> {
+    /// The path of the listing, e.g. `/manifests/2026-08-13.txt`
+    base: &'a str,
+    sort: Sort,
+    show: Show,
+    /// 1-based
+    page: usize,
+}
+
+impl View<'_> {
+    /// A new order starts back at page 1, as the old page number points at other rows
+    fn with_sort(self, sort: Sort) -> Self {
+        Self {
+            sort,
+            page: 1,
+            ..self
+        }
+    }
+
+    fn with_show(self, show: Show) -> Self {
+        Self {
+            show,
+            page: 1,
+            ..self
+        }
+    }
+
+    fn with_page(self, page: usize) -> Self {
+        Self { page, ..self }
+    }
+
+    /// The URL of this view. Defaults stay out of it, other than `sort`, to keep URLs short.
+    fn href(&self) -> String {
+        let mut href = format!("{}?sort={}", self.base, self.sort.param());
+        if self.show != Show::Present {
+            href.push_str("&show=");
+            href.push_str(self.show.param());
+        }
+        if self.page != 1 {
+            href.push_str(&format!("&page={}", self.page));
+        }
+        href
+    }
+}
+
+/// A crate table with sortable `crate` and `written` column headers
+fn crate_table(rows: &[&Listed<'_>], view: View<'_>) -> Markup {
     html! {
         table {
             thead {
                 tr {
-                    th { (sort_link(base, "crate", Sort::Name, sort)) }
+                    th { (sort_link(view, "crate", Sort::Name)) }
                     th { "version" }
-                    th { (sort_link(base, "written", Sort::Written, sort)) }
+                    th { (sort_link(view, "written", Sort::Written)) }
                 }
             }
             tbody {
-                @for l in listed {
+                @for l in rows {
                     tr .culled[!l.in_mirror()] {
                         td { (l.krate.name) }
                         td { (l.krate.version) }
@@ -328,23 +454,40 @@ fn crate_table(listed: &[&Listed<'_>], base: &str, sort: Sort) -> Markup {
     }
 }
 
-/// The culled crates, behind a "show culled" toggle so the crates that still have to make
-/// the trip stay in view. Empty markup when nothing was culled.
-fn culled_section(culled: &[&Listed<'_>], base: &str, sort: Sort) -> Markup {
+/// One page of `rows` as a table, between links to the pages around it
+fn paged_table(rows: &[&Listed<'_>], view: View<'_>) -> Markup {
+    let page = paginate(rows, view.page);
+    let view = view.with_page(page.number);
     html! {
-        @if !culled.is_empty() {
-            details.culled-group {
-                summary { "show culled (" (culled.len()) ")" }
-                (crate_table(culled, base, sort))
+        (pager(&page, view))
+        (crate_table(page.rows, view))
+        (pager(&page, view))
+    }
+}
+
+/// Links to the previous and next page. Empty markup when everything fits on one page.
+fn pager<T>(page: &Page<'_, T>, view: View<'_>) -> Markup {
+    html! {
+        @if page.count > 1 {
+            nav.pages {
+                @if page.number > 1 {
+                    a href=(view.with_page(1).href()) { "first" }
+                    a href=(view.with_page(page.number - 1).href()) { "prev" }
+                }
+                span.count { "page " (page.number) " of " (page.count) }
+                @if page.number < page.count {
+                    a href=(view.with_page(page.number + 1).href()) { "next" }
+                    a href=(view.with_page(page.count).href()) { "last" }
+                }
             }
         }
     }
 }
 
 /// Column header that re-requests the page sorted by `column`
-fn sort_link(base: &str, label: &str, column: Sort, active: Sort) -> Markup {
+fn sort_link(view: View<'_>, label: &str, column: Sort) -> Markup {
     html! {
-        a.sort.active[column == active] href={ (base) "?sort=" (column.param()) } { (label) }
+        a.sort.active[column == view.sort] href=(view.with_sort(column).href()) { (label) }
     }
 }
 
@@ -404,9 +547,8 @@ tr + tr td { border-top: 1px solid color-mix(in srgb, currentColor 15%, transpar
 .count { color: color-mix(in srgb, currentColor 65%, transparent); }
 input[type=search] { font: inherit; padding: .3rem; min-width: 16rem; }
 p.empty { color: color-mix(in srgb, currentColor 65%, transparent); }
-details.culled-group { margin-top: 1.5rem; }
-details.culled-group summary { cursor: pointer; padding: .25rem 0;
-                               color: color-mix(in srgb, currentColor 65%, transparent); }
+nav.pages { margin: .75rem 0; }
+nav.pages a, nav.pages span { margin-right: .75rem; }
 a.sort { color: inherit; text-decoration: none; }
 a.sort:hover { text-decoration: underline; }
 a.sort.active::after { content: ' \\2193'; }
@@ -463,7 +605,11 @@ fn search_form(query: &str, focus: Focus) -> Markup {
 
 /// Index: every manifest file with its crate count
 async fn manifests_index(State(state): State<Arc<AppState>>) -> Result<Markup, StatusCode> {
-    let Some(manifests) = load_manifests(&state)? else {
+    blocking(move || manifests_index_page(&state)).await
+}
+
+fn manifests_index_page(state: &AppState) -> Result<Markup, StatusCode> {
+    let Some(manifests) = load_manifests(state)? else {
         return Ok(no_manifests_page());
     };
 
@@ -499,27 +645,39 @@ async fn manifests_index(State(state): State<Arc<AppState>>) -> Result<Markup, S
     ))
 }
 
-/// Detail: the crates listed in one manifest, marked present or culled
+/// Detail: the crates listed in one manifest, split into present and culled
 async fn manifest_detail(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(name): axum::extract::Path<String>,
-    Query(params): Query<SortParams>,
+    Query(params): Query<ListParams>,
+) -> Result<Markup, StatusCode> {
+    blocking(move || manifest_detail_page(&state, &name, params)).await
+}
+
+fn manifest_detail_page(
+    state: &AppState,
+    name: &str,
+    params: ListParams,
 ) -> Result<Markup, StatusCode> {
     let Some(dir) = state.manifests_path.as_deref() else {
         return Ok(no_manifests_page());
     };
 
     // Parse only the one file, so the page cost does not grow with the number of manifests
-    let found = manifest::load_one(dir, &name)
+    let found = manifest::load_one(dir, name)
         .map_err(|e| {
-            warn!("failed to read manifest {name} from {}: {e:#}", dir.display());
+            warn!(
+                "failed to read manifest {name} from {}: {e:#}",
+                dir.display()
+            );
             StatusCode::INTERNAL_SERVER_ERROR
         })?
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    let listed = listing(&state.mirror_path, &found.crates, params.sort());
-    let (present, culled) = split_culled(&listed);
     let base = format!("/manifests/{}", found.name);
+    let view = params.view(&base);
+    let listed = listing(&state.mirror_path, &found.crates, view.sort);
+    let (present, culled) = split_culled(&listed);
 
     Ok(page(
         &format!("{} - zerus", found.name),
@@ -529,12 +687,30 @@ async fn manifest_detail(
                 (listed.len()) " crate(s), " (present.len()) " still in mirror, "
                 (culled.len()) " culled"
             }
-            @if present.is_empty() {
-                p.empty { "Every crate in this manifest was culled." }
-            } @else {
-                (crate_table(&present, &base, params.sort()))
+            @match view.show {
+                Show::Present => {
+                    @if !culled.is_empty() {
+                        p { a href=(view.with_show(Show::Culled).href()) {
+                            "show culled (" (culled.len()) ")"
+                        } }
+                    }
+                    @if present.is_empty() {
+                        p.empty { "Every crate in this manifest was culled." }
+                    } @else {
+                        (paged_table(&present, view))
+                    }
+                }
+                Show::Culled => {
+                    p { a href=(view.with_show(Show::Present).href()) {
+                        "show still in mirror (" (present.len()) ")"
+                    } }
+                    @if culled.is_empty() {
+                        p.empty { "No crate in this manifest was culled." }
+                    } @else {
+                        (paged_table(&culled, view))
+                    }
+                }
             }
-            (culled_section(&culled, &base, params.sort()))
         },
     ))
 }
@@ -542,9 +718,13 @@ async fn manifest_detail(
 /// The mirror crates that no manifest records, i.e. crates that have not made a trip yet
 async fn unmanifested(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<SortParams>,
+    Query(params): Query<ListParams>,
 ) -> Result<Markup, StatusCode> {
-    let Some(manifests) = load_manifests(&state)? else {
+    blocking(move || unmanifested_page(&state, params)).await
+}
+
+fn unmanifested_page(state: &AppState, params: ListParams) -> Result<Markup, StatusCode> {
+    let Some(manifests) = load_manifests(state)? else {
         return Ok(no_manifests_page());
     };
 
@@ -552,8 +732,13 @@ async fn unmanifested(
         warn!("failed to scan {}: {e:#}", state.mirror_path.display());
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    let listed = listing(&state.mirror_path, &crates, params.sort());
     // Every entry comes from a file in the mirror, so none of them can be culled.
+    let view = ListParams {
+        show: None,
+        ..params
+    }
+    .view("/unmanifested");
+    let listed = listing(&state.mirror_path, &crates, view.sort);
     let all: Vec<&Listed<'_>> = listed.iter().collect();
 
     Ok(page(
@@ -564,10 +749,23 @@ async fn unmanifested(
             @if all.is_empty() {
                 p.empty { "Every crate in the mirror is in a manifest." }
             } @else {
-                (crate_table(&all, "/unmanifested", params.sort()))
+                (paged_table(&all, view))
             }
         },
     ))
+}
+
+/// Run blocking page work on the blocking thread pool. The manifest pages read and stat
+/// many files; on the async runtime, a slow disk would stall every other request too.
+async fn blocking(
+    render: impl FnOnce() -> Result<Markup, StatusCode> + Send + 'static,
+) -> Result<Markup, StatusCode> {
+    tokio::task::spawn_blocking(render)
+        .await
+        .unwrap_or_else(|e| {
+            warn!("page render task failed: {e}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        })
 }
 
 #[derive(serde::Deserialize)]
@@ -580,7 +778,14 @@ async fn manifest_search(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ManifestSearchParams>,
 ) -> Result<Markup, StatusCode> {
-    let Some(manifests) = load_manifests(&state)? else {
+    blocking(move || manifest_search_page(&state, params)).await
+}
+
+fn manifest_search_page(
+    state: &AppState,
+    params: ManifestSearchParams,
+) -> Result<Markup, StatusCode> {
+    let Some(manifests) = load_manifests(state)? else {
         return Ok(no_manifests_page());
     };
 
@@ -659,4 +864,275 @@ pub fn serve(
     })?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use axum::extract::Query;
+    use axum::http::Uri;
+
+    use super::*;
+
+    fn params(query: &str) -> ListParams {
+        let uri: Uri = format!("/x?{query}").parse().unwrap();
+        Query::<ListParams>::try_from_uri(&uri).unwrap().0
+    }
+
+    #[test]
+    fn list_params_parse_known_values() {
+        let p = params("sort=written&show=culled&page=3");
+        assert_eq!(p.sort, Some(Sort::Written));
+        assert_eq!(p.show, Some(Show::Culled));
+        assert_eq!(p.page, Some(3));
+    }
+
+    #[test]
+    fn list_params_ignore_bad_and_missing_values() {
+        for query in ["", "sort=zzz&show=all&page=abc", "page=-1", "page=", "sort=Name"] {
+            let p = params(query);
+            assert_eq!(p.sort, None, "{query}");
+            assert_eq!(p.show, None, "{query}");
+            assert_eq!(p.page, None, "{query}");
+        }
+    }
+
+    #[test]
+    fn view_defaults() {
+        let view = ListParams::default().view("/b");
+        assert_eq!(view.sort, Sort::Name);
+        assert_eq!(view.show, Show::Present);
+        assert_eq!(view.page, 1);
+        assert_eq!(view.href(), "/b?sort=name");
+    }
+
+    #[test]
+    fn view_href_keeps_every_non_default_field() {
+        let view = params("sort=written&show=culled&page=4").view("/manifests/a.txt");
+        assert_eq!(
+            view.href(),
+            "/manifests/a.txt?sort=written&show=culled&page=4"
+        );
+    }
+
+    #[test]
+    fn view_href_round_trips_through_list_params() {
+        for sort in [Sort::Name, Sort::Written] {
+            for show in [Show::Present, Show::Culled] {
+                for page in [1, 2, 99] {
+                    let view = View {
+                        base: "/b",
+                        sort,
+                        show,
+                        page,
+                    };
+                    let query = view.href().split_once('?').unwrap().1.to_string();
+                    assert_eq!(params(&query).view("/b"), view);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn new_sort_or_show_starts_at_page_one_and_keeps_the_rest() {
+        let view = params("sort=written&show=culled&page=4").view("/b");
+
+        let sorted = view.with_sort(Sort::Name);
+        assert_eq!(
+            (sorted.sort, sorted.show, sorted.page),
+            (Sort::Name, Show::Culled, 1)
+        );
+
+        let shown = view.with_show(Show::Present);
+        assert_eq!(
+            (shown.sort, shown.show, shown.page),
+            (Sort::Written, Show::Present, 1)
+        );
+    }
+
+    #[test]
+    fn paginate_empty_is_one_empty_page() {
+        let page = paginate::<u8>(&[], 1);
+        assert_eq!((page.rows.len(), page.number, page.count), (0, 1, 1));
+    }
+
+    #[test]
+    fn paginate_clamps_out_of_range_pages() {
+        let rows: Vec<usize> = (0..PAGE_SIZE * 2 + 1).collect();
+
+        let low = paginate(&rows, 0);
+        assert_eq!((low.number, low.rows[0]), (1, 0));
+
+        let high = paginate(&rows, usize::MAX);
+        assert_eq!((high.number, high.count), (3, 3));
+        assert_eq!(high.rows, [PAGE_SIZE * 2]);
+    }
+
+    /// Model check: for any length, the pages split the rows in order with no gap or overlap
+    #[test]
+    fn paginate_pages_cover_the_rows_exactly_once() {
+        let lengths = (0..=3)
+            .flat_map(|n| [n * PAGE_SIZE, n * PAGE_SIZE + 1, (n + 1) * PAGE_SIZE - 1])
+            .chain([7, 999, 1001, 2500]);
+        for len in lengths {
+            let rows: Vec<usize> = (0..len).collect();
+            let count = paginate(&rows, 1).count;
+            assert_eq!(count, len.div_ceil(PAGE_SIZE).max(1), "len {len}");
+
+            let joined: Vec<usize> = (1..=count)
+                .flat_map(|n| {
+                    let page = paginate(&rows, n);
+                    assert_eq!(page.number, n);
+                    assert!(page.rows.len() <= PAGE_SIZE);
+                    page.rows.to_vec()
+                })
+                .collect();
+            assert_eq!(joined, rows, "len {len}");
+        }
+    }
+
+    fn add_crate(mirror: &Path, name: &str, version: &str) {
+        let dir = get_crate_path(mirror, name, version).unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("{name}-{version}.crate")), b"x").unwrap();
+    }
+
+    /// A mirror holding `serde` and `tokio`, and a manifest that also lists the culled `axum`
+    fn fixture() -> (tempfile::TempDir, AppState) {
+        let tmp = tempfile::tempdir().unwrap();
+        let mirror = tmp.path().join("mirror");
+        let manifests = tmp.path().join("manifests");
+        fs::create_dir(&manifests).unwrap();
+        add_crate(&mirror, "serde", "1.0.210");
+        add_crate(&mirror, "tokio", "1.40.0");
+        fs::write(
+            manifests.join("a.txt"),
+            "tokio@1.40.0\nserde@1.0.210\naxum@0.8.1\n",
+        )
+        .unwrap();
+        // A broken manifest elsewhere must not break the page of `a.txt`
+        fs::write(manifests.join("broken.txt"), "nope\n").unwrap();
+
+        let state = AppState {
+            mirror_path: mirror,
+            manifests_path: Some(manifests),
+        };
+        (tmp, state)
+    }
+
+    fn detail(state: &AppState, name: &str, query: &str) -> Result<String, StatusCode> {
+        manifest_detail_page(state, name, params(query)).map(Markup::into_string)
+    }
+
+    #[test]
+    fn detail_lists_present_crates_and_links_to_culled() {
+        let (_tmp, state) = fixture();
+
+        let html = detail(&state, "a.txt", "").unwrap();
+
+        assert!(
+            html.contains("3 crate(s), 2 still in mirror, 1 culled"),
+            "{html}"
+        );
+        assert!(html.contains("serde") && html.contains("tokio"));
+        assert!(!html.contains("axum"));
+        assert!(html.contains(r#"href="/manifests/a.txt?sort=name&amp;show=culled""#));
+        assert!(html.contains("show culled (1)"));
+        // Name order, not file order
+        assert!(html.find("serde") < html.find("tokio"));
+        // Everything fits on one page
+        assert!(!html.contains("nav class=\"pages\""));
+    }
+
+    #[test]
+    fn detail_show_culled_lists_only_culled_crates() {
+        let (_tmp, state) = fixture();
+
+        let html = detail(&state, "a.txt", "show=culled").unwrap();
+
+        assert!(html.contains("axum"));
+        assert!(!html.contains("<td>serde</td>"));
+        assert!(html.contains("show still in mirror (2)"));
+    }
+
+    #[test]
+    fn detail_with_nothing_culled_has_no_culled_link() {
+        let (_tmp, state) = fixture();
+        let dir = state.manifests_path.as_deref().unwrap();
+        fs::write(dir.join("b.txt"), "serde@1.0.210\n").unwrap();
+
+        let html = detail(&state, "b.txt", "").unwrap();
+        assert!(!html.contains("show culled"));
+
+        let html = detail(&state, "b.txt", "show=culled").unwrap();
+        assert!(html.contains("No crate in this manifest was culled."));
+    }
+
+    #[test]
+    fn detail_with_everything_culled_says_so() {
+        let (_tmp, state) = fixture();
+        let dir = state.manifests_path.as_deref().unwrap();
+        fs::write(dir.join("b.txt"), "axum@0.8.1\n").unwrap();
+
+        let html = detail(&state, "b.txt", "").unwrap();
+
+        assert!(html.contains("Every crate in this manifest was culled."));
+        assert!(html.contains("show culled (1)"));
+    }
+
+    #[test]
+    fn detail_errors() {
+        let (_tmp, state) = fixture();
+        assert_eq!(detail(&state, "nope.txt", ""), Err(StatusCode::NOT_FOUND));
+        assert_eq!(detail(&state, "../mirror", ""), Err(StatusCode::NOT_FOUND));
+        assert_eq!(
+            detail(&state, "broken.txt", ""),
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        );
+
+        let no_dir = AppState {
+            mirror_path: state.mirror_path.clone(),
+            manifests_path: None,
+        };
+        let html = detail(&no_dir, "a.txt", "").unwrap();
+        assert!(html.contains("No manifests directory"));
+    }
+
+    #[test]
+    fn detail_pages_a_large_manifest() {
+        let (_tmp, state) = fixture();
+        let dir = state.manifests_path.as_deref().unwrap();
+        let lines: String = (0..PAGE_SIZE + 5)
+            .map(|n| format!("gone{n:05}@1.0.0\n"))
+            .collect();
+        fs::write(dir.join("big.txt"), lines).unwrap();
+
+        let first = detail(&state, "big.txt", "show=culled").unwrap();
+        assert!(first.contains("page 1 of 2"));
+        assert!(first.contains("<td>gone00000</td>"));
+        assert!(!first.contains(&format!("<td>gone{PAGE_SIZE:05}</td>")));
+        assert!(first.contains(r#"href="/manifests/big.txt?sort=name&amp;show=culled&amp;page=2""#));
+
+        let last = detail(&state, "big.txt", "show=culled&page=2").unwrap();
+        assert!(last.contains("page 2 of 2"));
+        assert!(last.contains(&format!("<td>gone{PAGE_SIZE:05}</td>")));
+        assert!(!last.contains("<td>gone00000</td>"));
+    }
+
+    #[test]
+    fn unmanifested_ignores_show_culled() {
+        let (_tmp, state) = fixture();
+        let dir = state.manifests_path.as_deref().unwrap();
+        fs::remove_file(dir.join("broken.txt")).unwrap();
+        fs::write(dir.join("a.txt"), "serde@1.0.210\n").unwrap();
+
+        let html = unmanifested_page(&state, params("show=culled"))
+            .unwrap()
+            .into_string();
+
+        assert!(html.contains("1 crate(s) in the mirror"));
+        assert!(html.contains("<td>tokio</td>"));
+        assert!(html.contains(r#"href="/unmanifested?sort=written""#));
+    }
 }
