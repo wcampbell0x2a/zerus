@@ -505,14 +505,16 @@ async fn manifest_detail(
     axum::extract::Path(name): axum::extract::Path<String>,
     Query(params): Query<SortParams>,
 ) -> Result<Markup, StatusCode> {
-    let Some(manifests) = load_manifests(&state)? else {
+    let Some(dir) = state.manifests_path.as_deref() else {
         return Ok(no_manifests_page());
     };
 
-    // Match against the listing rather than joining user input onto a path
-    let found = manifests
-        .into_iter()
-        .find(|m| m.name == name)
+    // Parse only the one file, so the page cost does not grow with the number of manifests
+    let found = manifest::load_one(dir, &name)
+        .map_err(|e| {
+            warn!("failed to read manifest {name} from {}: {e:#}", dir.display());
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
         .ok_or(StatusCode::NOT_FOUND)?;
 
     let listed = listing(&state.mirror_path, &found.crates, params.sort());
