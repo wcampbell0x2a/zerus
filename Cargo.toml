@@ -35,6 +35,10 @@ tracing-indicatif = "0.3"
 maud = { version = "0.27.0", features = ["axum"] }
 time = { version = "0.3", features = ["formatting", "macros"] }
 
+# The musl allocator is slow when many threads allocate at once, as the rayon stat calls on
+# the manifest pages do: those pages were 9 times slower than on glibc.
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = "0.1"
 
 [dev-dependencies]
 assert_cmd = { version = "2.0.16", features = ["color", "color-auto"] }

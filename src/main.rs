@@ -15,6 +15,11 @@ mod manifest;
 mod mirror;
 mod serve;
 
+// See the note on the mimalloc dependency in Cargo.toml
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn validate_url(url: &str) -> Result<String, String> {
     if url.starts_with("http://") || url.starts_with("https://") {
         Ok(url.to_string())
