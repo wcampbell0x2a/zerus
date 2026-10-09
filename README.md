@@ -97,6 +97,10 @@ browse them in the web UI at the root path.
 $ zerus serve new-mirror --manifests manifests/
 ```
 
+The server reads the mirror and the manifests when it starts, and keeps them in memory, so
+the pages stay fast when the mirror is on a slow or network disk. Only the manifest list at
+the root path reads the disk again. Load it to see new transfers and culls on the other pages.
+
 ### Build with mirror
 Add the following to `.cargo/config.toml` (replacing `[IP]` with your server address).
 ```toml

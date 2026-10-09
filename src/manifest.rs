@@ -4,6 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
+use rayon::prelude::*;
 use tracing::{debug, info};
 
 use crate::index::find_crate_files;
@@ -101,26 +102,25 @@ pub fn parse_manifests(paths: &[PathBuf]) -> anyhow::Result<BTreeSet<Crate>> {
     Ok(crates)
 }
 
-/// A single manifest file, identified by its file name
+/// A single manifest file and the result of parsing it. A file that fails to parse keeps its
+/// error, so it does not hide the files that parse.
 #[derive(Debug)]
-pub struct ManifestFile {
+pub struct ParsedFile {
     /// File name as-is, e.g. `2026-08-13.txt`. Treated as an opaque label
     pub name: String,
-    pub crates: Vec<Crate>,
+    pub crates: anyhow::Result<Vec<Crate>>,
 }
 
-/// Crates in the mirror that no manifest file records, i.e. crates that never made a trip
-pub fn unmanifested(mirror_path: &Path, manifests: &[ManifestFile]) -> anyhow::Result<Vec<Crate>> {
-    let recorded: BTreeSet<(&str, &str)> = manifests
-        .iter()
-        .flat_map(|m| &m.crates)
-        .map(|c| (c.name.as_str(), c.version.as_str()))
-        .collect();
-
-    let mut crates = generate(mirror_path)?;
-    crates.retain(|c| !recorded.contains(&(c.name.as_str(), c.version.as_str())));
-
-    Ok(crates)
+/// Crates in `mirror` that no manifest records, i.e. crates that never made a trip
+pub fn unmanifested<'m, 'r>(
+    mirror: impl IntoIterator<Item = &'m Crate>,
+    recorded: impl IntoIterator<Item = &'r Crate>,
+) -> Vec<&'m Crate> {
+    let recorded: BTreeSet<&Crate> = recorded.into_iter().collect();
+    mirror
+        .into_iter()
+        .filter(|c| !recorded.contains(*c))
+        .collect()
 }
 
 /// Manifest files in `dir` as `(file name, path)` pairs, in no set order.
@@ -147,35 +147,21 @@ fn list_dir(dir: &Path) -> anyhow::Result<Vec<(String, PathBuf)>> {
     Ok(files)
 }
 
-/// Parse every manifest file in `dir`, sorted by file name
-pub fn load_dir(dir: &Path) -> anyhow::Result<Vec<ManifestFile>> {
-    let mut manifests = list_dir(dir)?
-        .into_iter()
-        .map(|(name, path)| {
-            Ok(ManifestFile {
-                crates: parse_one(&path)?,
-                name,
-            })
+/// Parse each manifest file in `dir` on its own, sorted by file name.
+/// Fails only when `dir` itself cannot be read.
+pub fn parse_each(dir: &Path) -> anyhow::Result<Vec<ParsedFile>> {
+    // Each read is a round trip on a network mount, so do them in parallel
+    let mut files: Vec<ParsedFile> = list_dir(dir)?
+        .into_par_iter()
+        .map(|(name, path)| ParsedFile {
+            crates: parse_one(&path),
+            name,
         })
-        .collect::<anyhow::Result<Vec<_>>>()?;
+        .collect();
 
-    manifests.sort_by(|a, b| a.name.cmp(&b.name));
+    files.sort_by(|a, b| a.name.cmp(&b.name));
 
-    Ok(manifests)
-}
-
-/// Parse only the manifest file called `name` in `dir`, or `None` if there is no such file.
-/// `name` is matched against the directory listing, not joined onto `dir`, so a name such
-/// as `../secret` cannot reach a file outside of `dir`.
-pub fn load_one(dir: &Path, name: &str) -> anyhow::Result<Option<ManifestFile>> {
-    let Some((name, path)) = list_dir(dir)?.into_iter().find(|(n, _)| n == name) else {
-        return Ok(None);
-    };
-
-    Ok(Some(ManifestFile {
-        crates: parse_one(&path)?,
-        name,
-    }))
+    Ok(files)
 }
 
 /// Remove crates listed in the manifests from the mirror so they aren't transferred again
@@ -230,15 +216,20 @@ fn remove_empty_dirs(dir: &Path, stop: &Path) {
 mod tests {
     use super::*;
 
-    fn names(m: &ManifestFile) -> Vec<String> {
-        m.crates
-            .iter()
+    fn names_of<'a>(crates: impl IntoIterator<Item = &'a Crate>) -> Vec<String> {
+        crates
+            .into_iter()
             .map(|c| format!("{}@{}", c.name, c.version))
             .collect()
     }
 
+    /// The crates of a file that must parse
+    fn parsed(file: &ParsedFile) -> Vec<String> {
+        names_of(file.crates.as_ref().unwrap())
+    }
+
     #[test]
-    fn load_dir_attributes_crates_to_each_file() {
+    fn parse_each_attributes_crates_to_each_file() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(
             tmp.path().join("2026-08-13.txt"),
@@ -247,22 +238,19 @@ mod tests {
         .unwrap();
         fs::write(tmp.path().join("2026-06-01.txt"), "serde@1.0.204\n").unwrap();
 
-        let manifests = load_dir(tmp.path()).unwrap();
+        let files = parse_each(tmp.path()).unwrap();
 
-        // sorted by file name, and each file keeps its own crates
+        // sorted by file name, and each file keeps its own crates in file order
         assert_eq!(
-            manifests
-                .iter()
-                .map(|m| m.name.as_str())
-                .collect::<Vec<_>>(),
+            files.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
             ["2026-06-01.txt", "2026-08-13.txt"]
         );
-        assert_eq!(names(&manifests[0]), ["serde@1.0.204"]);
-        assert_eq!(names(&manifests[1]), ["serde@1.0.210", "axum@0.8.1"]);
+        assert_eq!(parsed(&files[0]), ["serde@1.0.204"]);
+        assert_eq!(parsed(&files[1]), ["serde@1.0.210", "axum@0.8.1"]);
     }
 
     #[test]
-    fn load_dir_skips_comments_blanks_dotfiles_and_dirs() {
+    fn parse_each_skips_comments_blanks_dotfiles_and_dirs() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(
             tmp.path().join("transfer.txt"),
@@ -272,86 +260,52 @@ mod tests {
         fs::write(tmp.path().join(".hidden.txt"), "tokio@1.40.0\n").unwrap();
         fs::create_dir(tmp.path().join("subdir")).unwrap();
 
-        let manifests = load_dir(tmp.path()).unwrap();
+        let files = parse_each(tmp.path()).unwrap();
 
-        assert_eq!(manifests.len(), 1);
-        assert_eq!(manifests[0].name, "transfer.txt");
-        assert_eq!(names(&manifests[0]), ["serde@1.0.210"]);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].name, "transfer.txt");
+        assert_eq!(parsed(&files[0]), ["serde@1.0.210"]);
     }
 
     #[test]
-    fn load_dir_reports_the_offending_file_and_line() {
+    fn parse_each_keeps_a_bad_file_apart_from_the_good_ones() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(
             tmp.path().join("bad.txt"),
             "serde@1.0.210\nnot-a-crate-line\n",
         )
         .unwrap();
-
-        let err = load_dir(tmp.path()).unwrap_err().to_string();
-
-        assert!(err.contains("bad.txt:2"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn load_dir_on_empty_dir_is_not_an_error() {
-        let tmp = tempfile::tempdir().unwrap();
-        assert!(load_dir(tmp.path()).unwrap().is_empty());
-    }
-
-    #[test]
-    fn load_one_parses_only_the_named_file() {
-        let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("good.txt"), "serde@1.0.210\n").unwrap();
-        // A bad file elsewhere in the dir must not fail the lookup of `good.txt`.
-        fs::write(tmp.path().join("bad.txt"), "not-a-crate-line\n").unwrap();
 
-        let manifest = load_one(tmp.path(), "good.txt").unwrap().unwrap();
+        let files = parse_each(tmp.path()).unwrap();
 
-        assert_eq!(manifest.name, "good.txt");
-        assert_eq!(names(&manifest), ["serde@1.0.210"]);
-    }
-
-    #[test]
-    fn load_one_reports_a_bad_named_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join("bad.txt"), "serde@1.0.210\nnope\n").unwrap();
-
-        let err = load_one(tmp.path(), "bad.txt").unwrap_err().to_string();
-
+        let err = files[0].crates.as_ref().unwrap_err().to_string();
         assert!(err.contains("bad.txt:2"), "unexpected error: {err}");
+        assert_eq!(parsed(&files[1]), ["serde@1.0.210"]);
     }
 
     #[test]
-    fn load_one_on_a_missing_name_is_none() {
+    fn parse_each_rejects_an_empty_name_or_version() {
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join("a.txt"), "serde@1.0.210\n").unwrap();
-
-        assert!(load_one(tmp.path(), "b.txt").unwrap().is_none());
-        assert!(load_one(tmp.path(), "").unwrap().is_none());
-    }
-
-    #[test]
-    fn load_one_ignores_names_that_are_not_listed_manifests() {
-        let tmp = tempfile::tempdir().unwrap();
-        let manifests = tmp.path().join("manifests");
-        fs::create_dir(&manifests).unwrap();
-        fs::write(tmp.path().join("outside.txt"), "serde@1.0.210\n").unwrap();
-        fs::write(manifests.join(".hidden.txt"), "serde@1.0.210\n").unwrap();
-        fs::create_dir(manifests.join("subdir")).unwrap();
-
-        for name in ["../outside.txt", ".hidden.txt", "subdir", ".", ".."] {
-            assert!(
-                load_one(&manifests, name).unwrap().is_none(),
-                "{name} must not load"
-            );
+        for (file, line) in [("a.txt", "@1.0.0"), ("b.txt", "serde@")] {
+            fs::write(tmp.path().join(file), format!("{line}\n")).unwrap();
         }
+
+        let files = parse_each(tmp.path()).unwrap();
+
+        assert!(files.iter().all(|f| f.crates.is_err()));
     }
 
     #[test]
-    fn load_one_on_a_missing_dir_is_an_error() {
+    fn parse_each_on_empty_dir_is_not_an_error() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(load_one(&tmp.path().join("nope"), "a.txt").is_err());
+        assert!(parse_each(tmp.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_each_on_a_missing_dir_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(parse_each(&tmp.path().join("nope")).is_err());
     }
 
     /// Put a `.crate` file in the mirror at the layout `generate` expects
@@ -361,82 +315,76 @@ mod tests {
         fs::write(dir.join(format!("{name}-{version}.crate")), b"x").unwrap();
     }
 
-    fn manifest(name: &str, crates: &[(&str, &str)]) -> ManifestFile {
-        ManifestFile {
-            name: name.to_string(),
-            crates: crates
-                .iter()
-                .map(|(n, v)| Crate::new(n.to_string(), v.to_string()))
-                .collect(),
-        }
+    fn crates(list: &[(&str, &str)]) -> Vec<Crate> {
+        list.iter()
+            .map(|(n, v)| Crate::new(n.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn generate_lists_the_crate_files_in_name_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        add_crate(tmp.path(), "tokio", "1.40.0");
+        add_crate(tmp.path(), "serde", "1.0.210");
+
+        let mirror = generate(tmp.path()).unwrap();
+
+        assert_eq!(names_of(&mirror), ["serde@1.0.210", "tokio@1.40.0"]);
+    }
+
+    #[test]
+    fn generate_on_a_mirror_with_no_crates_dir_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(generate(tmp.path()).is_err());
     }
 
     #[test]
     fn unmanifested_finds_mirror_crates_that_no_manifest_records() {
-        let tmp = tempfile::tempdir().unwrap();
-        add_crate(tmp.path(), "serde", "1.0.210");
-        add_crate(tmp.path(), "tokio", "1.40.0");
-        add_crate(tmp.path(), "axum", "0.8.1");
+        let mirror = crates(&[
+            ("axum", "0.8.1"),
+            ("serde", "1.0.210"),
+            ("tokio", "1.40.0"),
+        ]);
+        let recorded = crates(&[("serde", "1.0.210"), ("axum", "0.8.1")]);
 
-        let manifests = [
-            manifest("a.txt", &[("serde", "1.0.210")]),
-            manifest("b.txt", &[("axum", "0.8.1")]),
-        ];
-
-        let crates = unmanifested(tmp.path(), &manifests).unwrap();
-
-        assert_eq!(names_of(&crates), ["tokio@1.40.0"]);
+        assert_eq!(
+            names_of(unmanifested(&mirror, &recorded)),
+            ["tokio@1.40.0"]
+        );
     }
 
     #[test]
     fn unmanifested_matches_on_version_not_name_alone() {
-        let tmp = tempfile::tempdir().unwrap();
-        add_crate(tmp.path(), "serde", "1.0.210");
-        add_crate(tmp.path(), "serde", "1.0.204");
-
+        let mirror = crates(&[("serde", "1.0.204"), ("serde", "1.0.210")]);
         // A manifest recording one version leaves the other un-manifested.
-        let manifests = [manifest("a.txt", &[("serde", "1.0.204")])];
+        let recorded = crates(&[("serde", "1.0.204")]);
 
-        let crates = unmanifested(tmp.path(), &manifests).unwrap();
-
-        assert_eq!(names_of(&crates), ["serde@1.0.210"]);
+        assert_eq!(
+            names_of(unmanifested(&mirror, &recorded)),
+            ["serde@1.0.210"]
+        );
     }
 
     #[test]
     fn unmanifested_with_no_manifests_is_the_whole_mirror() {
-        let tmp = tempfile::tempdir().unwrap();
-        add_crate(tmp.path(), "serde", "1.0.210");
-        add_crate(tmp.path(), "tokio", "1.40.0");
+        let mirror = crates(&[("serde", "1.0.210"), ("tokio", "1.40.0")]);
 
-        let crates = unmanifested(tmp.path(), &[]).unwrap();
-
-        assert_eq!(names_of(&crates), ["serde@1.0.210", "tokio@1.40.0"]);
+        assert_eq!(
+            names_of(unmanifested(&mirror, &crates(&[]))),
+            ["serde@1.0.210", "tokio@1.40.0"]
+        );
     }
 
     #[test]
     fn unmanifested_ignores_manifest_entries_absent_from_the_mirror() {
-        let tmp = tempfile::tempdir().unwrap();
-        add_crate(tmp.path(), "serde", "1.0.210");
-
+        let mirror = crates(&[("serde", "1.0.210")]);
         // `axum` was culled, so it is in a manifest but not in the mirror.
-        let manifests = [manifest("a.txt", &[("axum", "0.8.1")])];
+        let recorded = crates(&[("axum", "0.8.1")]);
 
-        let crates = unmanifested(tmp.path(), &manifests).unwrap();
-
-        assert_eq!(names_of(&crates), ["serde@1.0.210"]);
-    }
-
-    #[test]
-    fn unmanifested_on_a_mirror_with_no_crates_dir_is_an_error() {
-        let tmp = tempfile::tempdir().unwrap();
-        assert!(unmanifested(tmp.path(), &[]).is_err());
-    }
-
-    fn names_of(crates: &[Crate]) -> Vec<String> {
-        crates
-            .iter()
-            .map(|c| format!("{}@{}", c.name, c.version))
-            .collect()
+        assert_eq!(
+            names_of(unmanifested(&mirror, &recorded)),
+            ["serde@1.0.210"]
+        );
     }
 
     #[test]
