@@ -100,6 +100,8 @@ $ zerus serve new-mirror --manifests manifests/
 The server reads the mirror and the manifests when it starts, and keeps them in memory, so
 the pages stay fast when the mirror is on a slow or network disk. Only the manifest list at
 the root path reads the disk again. Load it to see new transfers and culls on the other pages.
+Each page shows when the scan of its data started. If a scan is already running when you load
+the manifest list, the page waits for that scan and uses its result.
 
 ### Build with mirror
 Add the following to `.cargo/config.toml` (replacing `[IP]` with your server address).
