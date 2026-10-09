@@ -333,6 +333,29 @@ mod tests {
     }
 
     #[test]
+    fn generate_follows_symlinked_dirs_and_skips_other_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        add_crate(tmp.path(), "tokio", "1.40.0");
+        // A crate dir that lives on another disk, linked into the mirror
+        let elsewhere = tempfile::tempdir().unwrap();
+        add_crate(elsewhere.path(), "serde", "1.0.210");
+        let serde = get_crate_path(tmp.path(), "serde", "1.0.210").unwrap();
+        fs::create_dir_all(serde.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(
+            get_crate_path(elsewhere.path(), "serde", "1.0.210").unwrap(),
+            &serde,
+        )
+        .unwrap();
+        // Not crate files
+        fs::write(tmp.path().join("crates/notes.txt"), "").unwrap();
+        fs::create_dir_all(tmp.path().join("crates/empty")).unwrap();
+
+        let mirror = generate(tmp.path()).unwrap();
+
+        assert_eq!(names_of(&mirror), ["serde@1.0.210", "tokio@1.40.0"]);
+    }
+
+    #[test]
     fn generate_on_a_mirror_with_no_crates_dir_is_an_error() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(generate(tmp.path()).is_err());
@@ -340,17 +363,10 @@ mod tests {
 
     #[test]
     fn unmanifested_finds_mirror_crates_that_no_manifest_records() {
-        let mirror = crates(&[
-            ("axum", "0.8.1"),
-            ("serde", "1.0.210"),
-            ("tokio", "1.40.0"),
-        ]);
+        let mirror = crates(&[("axum", "0.8.1"), ("serde", "1.0.210"), ("tokio", "1.40.0")]);
         let recorded = crates(&[("serde", "1.0.210"), ("axum", "0.8.1")]);
 
-        assert_eq!(
-            names_of(unmanifested(&mirror, &recorded)),
-            ["tokio@1.40.0"]
-        );
+        assert_eq!(names_of(unmanifested(&mirror, &recorded)), ["tokio@1.40.0"]);
     }
 
     #[test]
