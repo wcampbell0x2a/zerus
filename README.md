@@ -37,8 +37,8 @@ a restart.
 
 ### Pack a transfer
 `zerus pack` downloads your dependencies, leaves out what earlier transfers already carried,
-and records this one. It writes a single pack file: a magic header followed by a zstd
-SquashFS image holding the crates and a manifest of what is inside.
+and records this one. It writes a single pack file: a magic header followed by a cpio
+archive (newc) holding the crates and a manifest of what is inside.
 ```console
 $ zerus pack new-mirror Cargo.toml --manifests manifests/
 ```

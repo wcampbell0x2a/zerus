@@ -234,10 +234,8 @@ fn run() -> anyhow::Result<()> {
 
     // `--verbose` raises the default level to `debug`; `RUST_LOG` overrides.
     let default_level = if args.verbose { "debug" } else { "info" };
-    // backhand narrates each squashfs section at info level, which buries the pack/unpack
-    // progress, so it is quieted unless RUST_LOG asks for it.
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(format!("zerus={default_level},backhand=warn,info")));
+        .unwrap_or_else(|_| EnvFilter::new(format!("zerus={default_level},info")));
 
     // Deterministic output (no timestamps/ANSI) for snapshot tests.
     let test_log = std::env::var_os("ZERUS_LOG_TEST").is_some();
@@ -407,7 +405,12 @@ fn pack_transfer(t: PackTransfer) -> anyhow::Result<()> {
         t.get_feature_gated,
     )?;
 
-    write_pack(&t.mirror_path, &t.output, t.manifests.as_deref(), t.no_record)
+    write_pack(
+        &t.mirror_path,
+        &t.output,
+        t.manifests.as_deref(),
+        t.no_record,
+    )
 }
 
 /// Select what has not been transferred, write the pack, and record it.

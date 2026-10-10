@@ -820,26 +820,16 @@ async fn run_upload(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    // backhand seeks over the image, so the upload lands in a temporary file first.
-    let temp = tempfile::NamedTempFile::new().map_err(|e| {
-        warn!("failed to create temp file: {e}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    std::fs::write(temp.path(), &body).map_err(|e| {
-        warn!("failed to buffer upload: {e}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
     let mirror_path = state.mirror_path.clone();
     let dl_url = state.dl_url.clone();
-    let temp_path = temp.path().to_path_buf();
     let manifests_path = state.manifests_path.clone();
     let pack_name = name.clone();
 
     // Merging and indexing are blocking and can take a while on a big pack, so they run
     // off the async runtime's worker threads.
     let summary = tokio::task::spawn_blocking(move || {
-        let summary = crate::pack::merge(&temp_path, &mirror_path)?;
+        let summary =
+            crate::pack::merge_from(std::io::Cursor::new(body), &pack_name, &mirror_path)?;
 
         // The pack carries its own manifest, so an upload leaves the same record here that
         // the sending side kept. Without a manifests dir there is nowhere to put it, and

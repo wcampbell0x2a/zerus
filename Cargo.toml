@@ -34,17 +34,15 @@ tower-http = { version = "0.6", features = ["trace"] }
 tracing-indicatif = "0.3"
 maud = { version = "0.27.0", features = ["axum"] }
 time = { version = "0.3", features = ["formatting", "macros"] }
-# `push_file_from_path` opens each file only while it is read, which packing a mirror of a
-# few thousand crates needs. Point back at the release once
-# https://github.com/wcampbell0x2a/backhand/pull/812 is merged and published.
-backhand = { version = "0.25.2", default-features = false, features = ["zstd", "parallel"], git = "https://github.com/wcampbell0x2a/backhand", branch = "add-lazy-file-writing" }
-tempfile = "3.13.0"
+# 0.6.2 streams entry data and writes archives larger than 4 GiB.
+librarium = "0.6.2"
 
 
 [dev-dependencies]
 assert_cmd = { version = "2.0.16", features = ["color", "color-auto"] }
 tempfile = "3.13.0"
 insta = "1.42.1"
+proptest = "1"
 
 [profile.release]
 strip = true

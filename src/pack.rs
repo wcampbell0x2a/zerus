@@ -1,28 +1,32 @@
 //! The zerus pack file: a single self-describing container that carries one transfer.
 //!
-//! Layout is a small header followed by a SquashFS image:
+//! Layout is a small header followed by a cpio archive (newc format):
 //!
 //! ```text
-//! magic "ZERUSPK\0" | u32 format version | SquashFS (zstd)
+//! magic "ZERUSPK\0" | u32 format version | cpio (newc)
 //! ```
 //!
-//! Inside the image:
+//! Inside the archive:
 //!
 //! ```text
-//! /manifest.txt                       name@version per line
-//! /crates/{prefix}/{name}/{version}/  the .crate files, mirror layout
+//! manifest.txt                       name@version per line
+//! crates/{prefix}/{name}/{version}/  the .crate files, mirror layout
 //! ```
+//!
+//! The archive is not compressed: `.crate` files are already gzip-compressed, so a second
+//! pass saves about one percent and costs a full extra read and write.
 //!
 //! The manifest travels with the crates, so the receiving side does not need the sending
 //! side's bookkeeping to know what arrived.
 
+use std::collections::HashMap;
+use std::fmt::Display;
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context};
-use backhand::compression::Compressor;
-use backhand::{FilesystemCompressor, FilesystemReader, FilesystemWriter, InnerNode, NodeHeader};
+use librarium::{ArchiveReader, ArchiveWriter, CpioHeader, CpioReader, Header, NewcHeader, Object};
 use tracing::{debug, info};
 
 use crate::index::find_crate_files;
@@ -34,24 +38,85 @@ const MAGIC: &[u8; 8] = b"ZERUSPK\0";
 /// Bumped only for a change that an older zerus cannot read.
 const FORMAT_VERSION: u32 = 1;
 
-/// Bytes before the SquashFS image starts
+/// Bytes before the cpio archive starts
 const HEADER_LEN: u64 = MAGIC.len() as u64 + 4;
 
-/// Path of the manifest inside the image
-const MANIFEST_PATH: &str = "/manifest.txt";
+/// Path of the manifest inside the archive
+const MANIFEST_PATH: &str = "manifest.txt";
 
-/// `.crate` payloads are already gzip-compressed, so the block size matters more for the
-/// index-shaped data than for the crates. 256 KiB keeps the block table small on a mirror
-/// with thousands of files.
-const BLOCK_SIZE: u32 = 256 * 1024;
+/// Regular file, plain read permissions: the entries are data, never executed.
+const FILE_MODE: u32 = 0o100_644;
 
-/// Files in the image are data, never executed, so they carry plain read permissions.
-fn node_header() -> NodeHeader {
-    NodeHeader {
-        permissions: 0o644,
-        uid: 0,
-        gid: 0,
-        mtime: 0,
+fn entry_header(name: String) -> Header {
+    Header {
+        name,
+        mode: FILE_MODE,
+        nlink: 1,
+        ..Header::default()
+    }
+}
+
+/// A file that is open only while it is read.
+///
+/// The archive writer holds a reader for every entry until it writes the archive. A mirror
+/// runs to thousands of crates, and one open file each would pass the process descriptor
+/// limit. The writer reads entries in order, so this keeps at most one file open.
+struct LazyFile {
+    path: PathBuf,
+    len: u64,
+    pos: u64,
+    file: Option<File>,
+}
+
+impl LazyFile {
+    fn new(path: PathBuf) -> std::io::Result<Self> {
+        let len = fs::metadata(&path)?.len();
+        Ok(Self {
+            path,
+            len,
+            pos: 0,
+            file: None,
+        })
+    }
+}
+
+impl Read for LazyFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let file = match &mut self.file {
+            Some(file) => file,
+            None => {
+                let mut file = File::open(&self.path)?;
+                file.seek(SeekFrom::Start(self.pos))?;
+                self.file.insert(file)
+            }
+        };
+        let n = file.read(buf)?;
+        self.pos += n as u64;
+        if n == 0 || self.pos >= self.len {
+            self.file = None;
+        }
+
+        Ok(n)
+    }
+}
+
+impl Seek for LazyFile {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let target = match pos {
+            SeekFrom::Start(p) => Some(p),
+            SeekFrom::End(d) => self.len.checked_add_signed(d),
+            SeekFrom::Current(d) => self.pos.checked_add_signed(d),
+        };
+        self.pos = target.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "seek before start of file",
+            )
+        })?;
+        // The next read opens the file again at the new position.
+        self.file = None;
+
+        Ok(self.pos)
     }
 }
 
@@ -71,40 +136,6 @@ pub fn write(mirror_path: &Path, crates: &[Crate], output: &Path) -> anyhow::Res
         bail!("no crates to pack");
     }
 
-    let mut fs_writer = FilesystemWriter::default();
-    fs_writer.set_block_size(BLOCK_SIZE);
-    fs_writer.set_current_time();
-    fs_writer.set_compressor(
-        FilesystemCompressor::new(Compressor::Zstd, None)
-            .context("failed to set up zstd compression")?,
-    );
-
-    let manifest = manifest_bytes(crates);
-    fs_writer
-        .push_file(std::io::Cursor::new(manifest), MANIFEST_PATH, node_header())
-        .context("failed to add manifest to pack")?;
-
-    // Pushed by path, so the writer opens each file only while it reads it. Handing it open
-    // files would need one descriptor per crate, and a mirror runs to thousands.
-    for c in crates {
-        let path = crate_file_path(mirror_path, c)?;
-        if !path.is_file() {
-            bail!("failed to open {}", path.display());
-        }
-
-        let inner = inner_crate_path(c)?;
-        let parent = inner
-            .parent()
-            .context("crate path inside pack has no parent")?;
-        fs_writer
-            .push_dir_all(parent, node_header())
-            .with_context(|| format!("failed to create {} in pack", parent.display()))?;
-        debug!("packing {}@{}", c.name, c.version);
-        fs_writer
-            .push_file_from_path(path, &inner, node_header())
-            .with_context(|| format!("failed to add {} to pack", inner.display()))?;
-    }
-
     if let Some(parent) = output.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)
@@ -117,10 +148,31 @@ pub fn write(mirror_path: &Path, crates: &[Crate], output: &Path) -> anyhow::Res
     let mut out = BufWriter::new(file);
     out.write_all(MAGIC)?;
     out.write_all(&FORMAT_VERSION.to_le_bytes())?;
-    fs_writer
-        .write_with_offset(&mut out, HEADER_LEN)
-        .context("failed to write squashfs image")?;
-    out.flush()?;
+
+    {
+        let mut archive = ArchiveWriter::<NewcHeader>::new(Box::new(&mut out));
+        archive
+            .push_file(
+                Cursor::new(manifest_bytes(crates)),
+                entry_header(MANIFEST_PATH.to_string()),
+            )
+            .context("failed to add manifest to pack")?;
+
+        for c in crates {
+            let path = crate_file_path(mirror_path, c)?;
+            let file = LazyFile::new(path.clone())
+                .with_context(|| format!("failed to open {}", path.display()))?;
+            let inner = inner_crate_path(c)?;
+            debug!("packing {}@{}", c.name, c.version);
+            archive
+                .push_file(file, entry_header(inner.clone()))
+                .with_context(|| format!("failed to add {inner} to pack"))?;
+        }
+
+        archive.write().context("failed to write cpio archive")?;
+    }
+    out.flush()
+        .with_context(|| format!("failed to write {}", output.display()))?;
     drop(out);
 
     let bytes = fs::metadata(output)
@@ -154,39 +206,102 @@ fn crate_file_path(mirror_path: &Path, c: &Crate) -> anyhow::Result<PathBuf> {
     Ok(dir.join(format!("{}-{}.crate", c.name, c.version)))
 }
 
-/// Where a crate's file lives inside the pack, mirroring the on-disk layout
-fn inner_crate_path(c: &Crate) -> anyhow::Result<PathBuf> {
+/// Where a crate's file lives inside the pack, mirroring the on-disk layout.
+///
+/// Archive names always use `/`, so a pack written on one OS reads the same on another.
+fn inner_crate_path(c: &Crate) -> anyhow::Result<String> {
     let prefix = crate::get_index_prefix(&c.name)
         .with_context(|| format!("invalid crate name: {}", c.name))?;
+    let prefix = prefix
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
 
-    Ok(Path::new("/crates")
-        .join(prefix)
-        .join(&c.name)
-        .join(&c.version)
-        .join(format!("{}-{}.crate", c.name, c.version)))
+    Ok(format!(
+        "crates/{prefix}/{name}/{version}/{name}-{version}.crate",
+        name = c.name,
+        version = c.version
+    ))
 }
 
 /// Read the header and fail early on a file that is not a pack
-fn read_header(file: &mut File, path: &Path) -> anyhow::Result<()> {
+fn read_header(reader: &mut impl Read, origin: &impl Display) -> anyhow::Result<()> {
     let mut magic = [0u8; 8];
-    file.read_exact(&mut magic)
-        .with_context(|| format!("{} is too short to be a pack file", path.display()))?;
+    reader
+        .read_exact(&mut magic)
+        .with_context(|| format!("{origin} is too short to be a pack file"))?;
     if &magic != MAGIC {
-        bail!("{} is not a zerus pack file", path.display());
+        bail!("{origin} is not a zerus pack file");
     }
 
     let mut version = [0u8; 4];
-    file.read_exact(&mut version)
-        .with_context(|| format!("{} is truncated", path.display()))?;
+    reader
+        .read_exact(&mut version)
+        .with_context(|| format!("{origin} is truncated"))?;
     let version = u32::from_le_bytes(version);
     if version > FORMAT_VERSION {
         bail!(
-            "{} uses pack format {version}, but this zerus reads up to {FORMAT_VERSION}; upgrade zerus",
-            path.display()
+            "{origin} uses pack format {version}, but this zerus reads up to {FORMAT_VERSION}; upgrade zerus"
         );
     }
 
     Ok(())
+}
+
+/// An opened pack: its entry table, and the reader that holds the entry data
+struct OpenPack<'r> {
+    archive: ArchiveReader<'r, NewcHeader>,
+    /// Entry index by name, so a lookup does not scan the whole table
+    by_name: HashMap<String, usize>,
+}
+
+impl<'r> OpenPack<'r> {
+    fn open<R: Read + Seek + 'r>(mut reader: R, origin: &impl Display) -> anyhow::Result<Self> {
+        read_header(&mut reader, origin)?;
+        let archive = ArchiveReader::<NewcHeader>::from_reader_with_offset(reader, HEADER_LEN)
+            .with_context(|| format!("failed to read cpio archive in {origin}"))?;
+        let by_name = archive
+            .objects
+            .inner
+            .iter()
+            .enumerate()
+            .map(|(i, object)| (object.header.name().to_string(), i))
+            .collect();
+
+        Ok(Self { archive, by_name })
+    }
+
+    fn entry(&self, name: &str) -> Option<&Object<NewcHeader>> {
+        self.by_name
+            .get(name)
+            .map(|&i| &self.archive.objects.inner[i])
+    }
+
+    /// Copy the data of the entry at `name` to `writer`. False if there is no such entry.
+    fn extract(&mut self, name: &str, writer: &mut (impl Write + Seek)) -> anyhow::Result<bool> {
+        let Some(&i) = self.by_name.get(name) else {
+            return Ok(false);
+        };
+        let object = &self.archive.objects.inner[i];
+        self.archive.reader.extract_data(object, writer)?;
+
+        Ok(true)
+    }
+
+    fn manifest(&mut self, origin: &impl Display) -> anyhow::Result<Vec<Crate>> {
+        let mut contents = Cursor::new(Vec::new());
+        let found = self
+            .extract(MANIFEST_PATH, &mut contents)
+            .with_context(|| format!("failed to read manifest from {origin}"))?;
+        if !found {
+            bail!("no manifest found in {origin}");
+        }
+        let contents = String::from_utf8(contents.into_inner())
+            .with_context(|| format!("manifest in {origin} is not UTF-8"))?;
+
+        parse_manifest(&contents, origin)
+    }
 }
 
 /// What a merge added to the mirror
@@ -211,84 +326,58 @@ impl MergeSummary {
 
 /// Read the manifest from a pack without unpacking the crates
 pub fn read_manifest(pack_path: &Path) -> anyhow::Result<Vec<Crate>> {
-    let mut file =
+    let file =
         File::open(pack_path).with_context(|| format!("failed to open {}", pack_path.display()))?;
-    read_header(&mut file, pack_path)?;
-    file.seek(SeekFrom::Start(0))?;
+    let origin = pack_path.display();
 
-    let reader = BufReader::new(file);
-    let fs_reader = FilesystemReader::from_reader_with_offset(reader, HEADER_LEN)
-        .with_context(|| format!("failed to read squashfs image in {}", pack_path.display()))?;
-
-    manifest_from(&fs_reader, pack_path)
-}
-
-/// Parse `/manifest.txt` out of an opened image
-fn manifest_from(fs_reader: &FilesystemReader, pack_path: &Path) -> anyhow::Result<Vec<Crate>> {
-    for node in fs_reader.files() {
-        if node.fullpath != Path::new(MANIFEST_PATH) {
-            continue;
-        }
-        let InnerNode::File(file) = &node.inner else {
-            bail!("{} in {} is not a file", MANIFEST_PATH, pack_path.display());
-        };
-
-        let mut contents = String::new();
-        fs_reader
-            .file(file)
-            .reader()
-            .read_to_string(&mut contents)
-            .with_context(|| format!("failed to read manifest from {}", pack_path.display()))?;
-
-        return parse_manifest(&contents, pack_path);
-    }
-
-    bail!("no manifest found in {}", pack_path.display())
+    OpenPack::open(BufReader::new(file), &origin)?.manifest(&origin)
 }
 
 /// `name@version` lines into crates
-fn parse_manifest(contents: &str, pack_path: &Path) -> anyhow::Result<Vec<Crate>> {
+fn parse_manifest(contents: &str, origin: &impl Display) -> anyhow::Result<Vec<Crate>> {
     let mut crates = Vec::new();
     for (n, line) in contents.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let Some((name, version)) = line.split_once('@') else {
+        let parsed = line
+            .split_once('@')
+            .filter(|(name, version)| !name.is_empty() && !version.is_empty());
+        let Some((name, version)) = parsed else {
             bail!(
-                "{}: manifest line {}: expected name@version, found {line:?}",
-                pack_path.display(),
+                "{origin}: manifest line {}: expected name@version, found {line:?}",
                 n + 1
             );
         };
-        if name.is_empty() || version.is_empty() {
-            bail!(
-                "{}: manifest line {}: expected name@version, found {line:?}",
-                pack_path.display(),
-                n + 1
-            );
-        }
         crates.push(Crate::new(name.to_string(), version.to_string()));
     }
 
     Ok(crates)
 }
 
-/// Merge the crates in `pack_path` into the mirror at `mirror_path`.
+/// Merge the crates in the pack file at `pack_path` into the mirror at `mirror_path`.
+///
+/// See [`merge_from`].
+pub fn merge(pack_path: &Path, mirror_path: &Path) -> anyhow::Result<MergeSummary> {
+    let file =
+        File::open(pack_path).with_context(|| format!("failed to open {}", pack_path.display()))?;
+
+    merge_from(BufReader::new(file), &pack_path.display(), mirror_path)
+}
+
+/// Merge the crates in the pack that `reader` holds into the mirror at `mirror_path`.
 ///
 /// A crate the mirror already holds is left alone, so re-applying a pack is safe.
-/// The caller updates the index; this only moves crate files.
-pub fn merge(pack_path: &Path, mirror_path: &Path) -> anyhow::Result<MergeSummary> {
-    let mut file =
-        File::open(pack_path).with_context(|| format!("failed to open {}", pack_path.display()))?;
-    read_header(&mut file, pack_path)?;
-    file.seek(SeekFrom::Start(0))?;
-
-    let reader = BufReader::new(file);
-    let fs_reader = FilesystemReader::from_reader_with_offset(reader, HEADER_LEN)
-        .with_context(|| format!("failed to read squashfs image in {}", pack_path.display()))?;
-
-    let manifest = manifest_from(&fs_reader, pack_path)?;
+/// The caller updates the index; this only moves crate files. `origin` names the pack in
+/// errors.
+pub fn merge_from<R: Read + Seek>(
+    reader: R,
+    origin: &impl Display,
+    mirror_path: &Path,
+) -> anyhow::Result<MergeSummary> {
+    let mut pack = OpenPack::open(reader, origin)?;
+    let manifest = pack.manifest(origin)?;
 
     let mut added = Vec::new();
     let mut skipped = Vec::new();
@@ -301,24 +390,13 @@ pub fn merge(pack_path: &Path, mirror_path: &Path) -> anyhow::Result<MergeSummar
         }
 
         let inner = inner_crate_path(&c)?;
-        let node = fs_reader
-            .files()
-            .find(|n| n.fullpath == inner)
-            .with_context(|| {
-                format!(
-                    "{} lists {}@{} but does not contain it",
-                    pack_path.display(),
-                    c.name,
-                    c.version
-                )
-            })?;
-        let InnerNode::File(inner_file) = &node.inner else {
+        if pack.entry(&inner).is_none() {
             bail!(
-                "{} in {} is not a file",
-                inner.display(),
-                pack_path.display()
+                "{origin} lists {}@{} but does not contain it",
+                c.name,
+                c.version
             );
-        };
+        }
 
         let parent = dest.parent().context("crate path has no parent")?;
         fs::create_dir_all(parent)
@@ -330,8 +408,7 @@ pub fn merge(pack_path: &Path, mirror_path: &Path) -> anyhow::Result<MergeSummar
         let mut out = BufWriter::new(
             File::create(&tmp).with_context(|| format!("failed to create {}", tmp.display()))?,
         );
-        let mut src = fs_reader.file(inner_file).reader();
-        std::io::copy(&mut src, &mut out)
+        pack.extract(&inner, &mut out)
             .with_context(|| format!("failed to extract {}@{}", c.name, c.version))?;
         out.flush()?;
         drop(out);
@@ -679,7 +756,7 @@ mod tests {
     fn a_file_that_is_not_a_pack_is_rejected_by_magic() {
         let tmp = tempfile::tempdir().unwrap();
         let bogus = tmp.path().join("not-a-pack.zpk");
-        fs::write(&bogus, b"this is definitely not a squashfs image").unwrap();
+        fs::write(&bogus, b"this is definitely not a pack file").unwrap();
 
         let err = merge(&bogus, tmp.path()).unwrap_err().to_string();
 
@@ -772,9 +849,7 @@ mod tests {
 
     #[test]
     fn a_manifest_line_without_a_version_is_rejected() {
-        let err = parse_manifest("serde\n", Path::new("p.zpk"))
-            .unwrap_err()
-            .to_string();
+        let err = parse_manifest("serde\n", &"p.zpk").unwrap_err().to_string();
 
         assert!(
             err.contains("expected name@version"),
@@ -784,9 +859,214 @@ mod tests {
 
     #[test]
     fn manifest_comments_and_blank_lines_are_skipped() {
-        let crates =
-            parse_manifest("# a comment\n\nserde@1.0.210\n  \n", Path::new("p.zpk")).unwrap();
+        let crates = parse_manifest("# a comment\n\nserde@1.0.210\n  \n", &"p.zpk").unwrap();
 
         assert_eq!(names(&crates), ["serde@1.0.210"]);
+    }
+
+    /// A pack built entry by entry, to make packs that `write` would never produce
+    fn raw_pack(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut image = MAGIC.to_vec();
+        image.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        let mut out = Cursor::new(&mut image);
+        out.seek(SeekFrom::End(0)).unwrap();
+        {
+            let mut archive = ArchiveWriter::<NewcHeader>::new(Box::new(&mut out));
+            for (name, data) in entries {
+                archive
+                    .push_file(Cursor::new(data.to_vec()), entry_header(name.to_string()))
+                    .unwrap();
+            }
+            archive.write().unwrap();
+        }
+
+        image
+    }
+
+    #[test]
+    fn archive_names_use_forward_slashes_for_every_prefix_length() {
+        let cases = [
+            ("a", "crates/1/a/1.0.0/a-1.0.0.crate"),
+            ("ab", "crates/2/ab/1.0.0/ab-1.0.0.crate"),
+            ("abc", "crates/3/a/abc/1.0.0/abc-1.0.0.crate"),
+            ("serde", "crates/se/rd/serde/1.0.0/serde-1.0.0.crate"),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(inner_crate_path(&krate(name, "1.0.0")).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn merge_from_memory_matches_merge_from_a_file() {
+        let src = tempfile::tempdir().unwrap();
+        add_crate(src.path(), "serde", "1.0.210", b"serde-payload");
+        let pack = src.path().join("out.zpk");
+        write(src.path(), &[krate("serde", "1.0.210")], &pack).unwrap();
+        let bytes = fs::read(&pack).unwrap();
+
+        let dest = tempfile::tempdir().unwrap();
+        let summary = merge_from(Cursor::new(bytes), &"upload.zpk", dest.path()).unwrap();
+
+        assert_eq!(names(&summary.added), ["serde@1.0.210"]);
+        let path = crate_file_path(dest.path(), &krate("serde", "1.0.210")).unwrap();
+        assert_eq!(fs::read(path).unwrap(), b"serde-payload");
+    }
+
+    #[test]
+    fn a_pack_without_a_manifest_is_rejected() {
+        let image = raw_pack(&[("crates/1/a/1.0.0/a-1.0.0.crate", b"a")]);
+        let dest = tempfile::tempdir().unwrap();
+
+        let err = merge_from(Cursor::new(image), &"p.zpk", dest.path())
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("no manifest found"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn a_manifest_that_lists_a_missing_crate_is_rejected() {
+        let image = raw_pack(&[(MANIFEST_PATH, b"a@1.0.0\n")]);
+        let dest = tempfile::tempdir().unwrap();
+
+        let err = merge_from(Cursor::new(image), &"p.zpk", dest.path())
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("does not contain it"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn a_pack_cut_short_is_an_error_and_writes_no_crate() {
+        let src = tempfile::tempdir().unwrap();
+        add_crate(src.path(), "serde", "1.0.210", &[7; 4096]);
+        let pack = src.path().join("out.zpk");
+        write(src.path(), &[krate("serde", "1.0.210")], &pack).unwrap();
+        let bytes = fs::read(&pack).unwrap();
+
+        // Cut part way through the crate data, as an interrupted copy leaves it.
+        let cut = bytes.len() / 2;
+        let dest = tempfile::tempdir().unwrap();
+        let result = merge_from(Cursor::new(bytes[..cut].to_vec()), &"p.zpk", dest.path());
+
+        assert!(result.is_err());
+        let path = crate_file_path(dest.path(), &krate("serde", "1.0.210")).unwrap();
+        assert!(!path.exists(), "a truncated crate reached the mirror");
+    }
+
+    #[test]
+    fn lazy_file_closes_after_the_last_byte() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("f");
+        fs::write(&path, b"hello").unwrap();
+        let mut lazy = LazyFile::new(path).unwrap();
+
+        let mut buf = Vec::new();
+        lazy.read_to_end(&mut buf).unwrap();
+
+        assert_eq!(buf, b"hello");
+        assert!(
+            lazy.file.is_none(),
+            "file stays open after it was read whole"
+        );
+    }
+
+    #[test]
+    fn lazy_file_rejects_a_seek_before_the_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("f");
+        fs::write(&path, b"hello").unwrap();
+        let mut lazy = LazyFile::new(path).unwrap();
+
+        assert!(lazy.seek(SeekFrom::Current(-1)).is_err());
+        assert!(lazy.seek(SeekFrom::End(-6)).is_err());
+        assert_eq!(lazy.seek(SeekFrom::End(-5)).unwrap(), 0);
+    }
+
+    #[test]
+    fn lazy_file_on_a_missing_path_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(LazyFile::new(tmp.path().join("absent")).is_err());
+    }
+
+    #[derive(Debug, Clone)]
+    enum FileOp {
+        Read(usize),
+        Seek(SeekFrom),
+    }
+
+    fn file_op() -> impl Strategy<Value = FileOp> {
+        prop_oneof![
+            (0usize..300).prop_map(FileOp::Read),
+            (0u64..300).prop_map(|p| FileOp::Seek(SeekFrom::Start(p))),
+            (-300i64..50).prop_map(|d| FileOp::Seek(SeekFrom::End(d))),
+            (-300i64..300).prop_map(|d| FileOp::Seek(SeekFrom::Current(d))),
+        ]
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// `LazyFile` must read and seek the same as a plain open `File`.
+        #[test]
+        fn lazy_file_behaves_like_a_file(
+            contents in prop::collection::vec(any::<u8>(), 0..256),
+            ops in prop::collection::vec(file_op(), 0..32),
+        ) {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("f");
+            fs::write(&path, &contents).unwrap();
+            let mut model = File::open(&path).unwrap();
+            let mut lazy = LazyFile::new(path).unwrap();
+
+            for op in ops {
+                match op {
+                    FileOp::Read(n) => {
+                        let mut want = vec![0; n];
+                        let mut got = vec![0; n];
+                        let want_n = model.read(&mut want).unwrap();
+                        let got_n = lazy.read(&mut got).unwrap();
+                        prop_assert_eq!(&got[..got_n], &want[..want_n]);
+                    }
+                    FileOp::Seek(pos) => {
+                        let want = model.seek(pos).ok();
+                        let got = lazy.seek(pos).ok();
+                        prop_assert_eq!(got, want);
+                    }
+                }
+            }
+        }
+
+        /// Any set of crates comes back byte for byte.
+        #[test]
+        fn round_trip_any_crate_contents(
+            payloads in prop::collection::vec(prop::collection::vec(any::<u8>(), 0..2048), 1..8),
+        ) {
+            let src = tempfile::tempdir().unwrap();
+            let crates: Vec<Crate> = payloads
+                .iter()
+                .enumerate()
+                .map(|(n, payload)| {
+                    let name = format!("crate{n}");
+                    add_crate(src.path(), &name, "1.0.0", payload);
+                    krate(&name, "1.0.0")
+                })
+                .collect();
+            let pack = src.path().join("out.zpk");
+            write(src.path(), &crates, &pack).unwrap();
+
+            let dest = tempfile::tempdir().unwrap();
+            merge(&pack, dest.path()).unwrap();
+
+            for (c, payload) in crates.iter().zip(&payloads) {
+                let path = crate_file_path(dest.path(), c).unwrap();
+                prop_assert_eq!(&fs::read(path).unwrap(), payload);
+            }
+        }
     }
 }
