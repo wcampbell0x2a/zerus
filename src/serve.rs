@@ -423,26 +423,24 @@ fn format_time_with_seconds(time: SystemTime) -> String {
         .unwrap_or_default()
 }
 
-/// Tells the user how old the data on a page is. `refresh` is how the manifest list got its
-/// snapshot, or `None` on a page that uses the cache only.
-fn scan_note(snapshot: &Snapshot, refresh: Option<Refresh>) -> Markup {
+/// Tells the user how old the data on a page is. `manual_refresh` is true when the user
+/// clicked Refresh on the manifest list, false when the page used the cached snapshot.
+fn scan_note(snapshot: &Snapshot, manual_refresh: bool) -> Markup {
     let started = format_time_with_seconds(snapshot.started);
     let took = format!("{:.1} s", snapshot.took.as_secs_f64());
     html! {
         p.scan {
-            @match refresh {
-                Some(Refresh::Started) => {
-                    "This load scanned the mirror and the manifests. Scan started "
-                    (started) ", took " (took) "."
+            @if manual_refresh {
+                "This load scanned the mirror and the manifests. Scan started "
+                (started) ", took " (took) "."
+            } @else {
+                "Data from the scan that started " (started)
+                @if snapshot.took.is_zero() {
+                    ", still loading in background"
+                } @else {
+                    ", took " (took)
                 }
-                Some(Refresh::Joined) => {
-                    "A scan was already running, so this load used its result. Scan started "
-                    (started) ", took " (took) "."
-                }
-                None => {
-                    "Data from the scan that started " (started) ". To scan again, load the "
-                    a href="/" { "manifest list" } "."
-                }
+                ". To scan again, click " a href="/?refresh=1" { "Refresh" } "."
             }
         }
     }
@@ -841,13 +839,25 @@ fn search_form(query: &str, focus: Focus) -> Markup {
 }
 
 /// Index: every manifest file with its crate count
-async fn manifests_index(State(state): State<Arc<AppState>>) -> Result<Markup, StatusCode> {
-    blocking(move || manifests_index_page(&state)).await
+async fn manifests_index(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<RefreshParams>,
+) -> Result<Markup, StatusCode> {
+    blocking(move || manifests_index_page(&state, params.refresh.is_some())).await
 }
 
-fn manifests_index_page(state: &AppState) -> Result<Markup, StatusCode> {
-    // The one page that reads the disk, so the user can pick up new transfers and culls
-    let (snapshot, refresh) = state.refresh();
+#[derive(serde::Deserialize, Default)]
+struct RefreshParams {
+    refresh: Option<u8>,
+}
+
+fn manifests_index_page(state: &AppState, refresh: bool) -> Result<Markup, StatusCode> {
+    let snapshot = if refresh {
+        let (snapshot, _) = state.refresh();
+        snapshot
+    } else {
+        state.snapshot()
+    };
     let Some(manifests) = snapshot.all_manifests()? else {
         return Ok(no_manifests_page());
     };
@@ -860,7 +870,10 @@ fn manifests_index_page(state: &AppState) -> Result<Markup, StatusCode> {
         "crates - zerus",
         html! {
             h1 { "Crates" }
-            (scan_note(&snapshot, Some(refresh)))
+            (scan_note(&snapshot, refresh))
+            p {
+                a href="/?refresh=1" { "Refresh" }
+            }
             table {
                 thead { tr { th { "manifest" } th { "crates" } } }
                 tbody {
@@ -924,7 +937,7 @@ fn manifest_detail_page(
         &format!("{name} - zerus"),
         html! {
             h1 { (name) }
-            (scan_note(&snapshot, None))
+            (scan_note(&snapshot, false))
             p.count {
                 (listed.len()) " crate(s), " (present.len()) " still in mirror, "
                 (culled.len()) " culled"
@@ -991,7 +1004,7 @@ fn unmanifested_page(state: &AppState, params: ListParams) -> Result<Markup, Sta
         "un-manifested - zerus",
         html! {
             h1 { "Un-manifested" }
-            (scan_note(&snapshot, None))
+            (scan_note(&snapshot, false))
             p.count { (all.len()) " crate(s) in the mirror that no manifest records" }
             @if all.is_empty() {
                 p.empty { "Every crate in the mirror is in a manifest." }
@@ -1058,7 +1071,7 @@ fn manifest_search_page(
         Focus::Search,
         html! {
             h1 { "Search" }
-            (scan_note(&snapshot, None))
+            (scan_note(&snapshot, false))
             @if query.is_empty() {
                 p.empty { "Enter a crate name." }
             } @else if hits.is_empty() {
@@ -1374,7 +1387,7 @@ mod tests {
         let html = detail(&state, "a.txt", "").unwrap();
         assert!(html.contains("2 still in mirror, 1 culled"), "{html}");
 
-        let list = manifests_index_page(&state).unwrap().into_string();
+        let list = manifests_index_page(&state, true).unwrap().into_string();
         assert!(list.contains("b.txt"), "{list}");
 
         // The list read the disk again, so the other pages now show the changes
@@ -1424,7 +1437,9 @@ mod tests {
         let pages: Vec<String> = (0..8)
             .map(|_| {
                 let state = Arc::clone(&state);
-                std::thread::spawn(move || manifests_index_page(&state).unwrap().into_string())
+                std::thread::spawn(move || {
+                    manifests_index_page(&state, true).unwrap().into_string()
+                })
             })
             .collect::<Vec<_>>()
             .into_iter()
@@ -1433,7 +1448,7 @@ mod tests {
 
         for page in &pages {
             assert!(
-                page.contains("This load scanned") || page.contains("already running"),
+                page.contains("This load scanned") || page.contains("Refresh"),
                 "{page}"
             );
         }
@@ -1445,7 +1460,7 @@ mod tests {
         let dir = state.manifests_path.as_deref().unwrap().to_path_buf();
         fs::remove_file(dir.join("broken.txt")).unwrap();
 
-        let list = manifests_index_page(&state).unwrap().into_string();
+        let list = manifests_index_page(&state, true).unwrap().into_string();
         assert!(
             list.contains("This load scanned the mirror and the manifests"),
             "{list}"
@@ -1454,7 +1469,10 @@ mod tests {
 
         let html = detail(&state, "a.txt", "").unwrap();
         assert!(html.contains("Data from the scan that started "), "{html}");
-        assert!(html.contains(r#"<a href="/">manifest list</a>"#), "{html}");
+        assert!(
+            html.contains(r#"<a href="/?refresh=1">Refresh</a>"#),
+            "{html}"
+        );
         let html = unmanifested_page(&state, params("")).unwrap().into_string();
         assert!(html.contains("Data from the scan that started "), "{html}");
     }
@@ -1473,7 +1491,7 @@ mod tests {
 
         // `broken.txt` fails the list, as the list must show every file
         assert_eq!(
-            manifests_index_page(&state).map(Markup::into_string),
+            manifests_index_page(&state, true).map(Markup::into_string),
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         );
         assert!(detail(&state, "b.txt", "").is_ok());
@@ -1486,7 +1504,7 @@ mod tests {
         fs::remove_file(dir.join("broken.txt")).unwrap();
         fs::write(dir.join("a.txt"), "serde@1.0.210\naxum@0.8.1\n").unwrap();
 
-        let list = manifests_index_page(&state).unwrap().into_string();
+        let list = manifests_index_page(&state, true).unwrap().into_string();
 
         assert!(
             list.contains(r#"<a href="/manifests/a.txt">a.txt</a>"#),
