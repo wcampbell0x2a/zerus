@@ -60,11 +60,14 @@ pub fn write_manifest(crates: &[Crate], output: Option<&Path>) -> anyhow::Result
     Ok(())
 }
 
-/// Parse `name@version` lines from a single manifest file, in file order
+/// Parse `name@version` lines from a single manifest file, in file order.
+/// Duplicate entries are deduplicated (last occurrence wins) so the UI
+/// never shows the same crate twice on a detail page.
 fn parse_one(path: &Path) -> anyhow::Result<Vec<Crate>> {
     let contents =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
 
+    let mut seen = std::collections::BTreeSet::new();
     let mut crates = Vec::new();
     for (n, line) in contents.lines().enumerate() {
         let line = line.trim();
@@ -85,7 +88,10 @@ fn parse_one(path: &Path) -> anyhow::Result<Vec<Crate>> {
                 n + 1
             );
         }
-        crates.push(Crate::new(name.to_string(), version.to_string()));
+        let krate = Crate::new(name.to_string(), version.to_string());
+        if seen.insert(krate.clone()) {
+            crates.push(krate);
+        }
     }
 
     Ok(crates)

@@ -314,6 +314,12 @@ pub fn write_index_entries(index_path: &Path, new_entries: &[IndexEntry]) -> any
     Ok(())
 }
 
+/// Generate a Cargo registry index from `.crate` files.
+///
+/// If `dl_url` is provided, writes a `config.json` with the sparse
+/// download URL. The URL is a base path — zerus appends
+/// `/crates/{prefix}/{crate}/{version}/{crate}-{version}.crate` to it.
+/// Pass the server address, not the full download template.
 pub fn update_index(
     index_path: &Path,
     crates_path: &Path,

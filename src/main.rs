@@ -23,7 +23,7 @@ fn validate_url(url: &str) -> Result<String, String> {
     }
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 struct Crate {
     name: String,
     version: String,

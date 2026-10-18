@@ -64,6 +64,10 @@ On the offline network, use `update-index` to generate a registry index from the
 ```console
 $ zerus update-index new-mirror --dl-url http://[IP]
 ```
+$ zerus update-index new-mirror --dl-url http://[IP]
+```
+
+The URL is a base path — zerus appends `/crates/{prefix}/{crate}/{version}/{crate}-{version}.crate` to it. Pass the server address, not the full download template.
 
 ### Serve mirror
 Use `zerus serve` to host the registry with sparse index, crate downloads, and a search API.
