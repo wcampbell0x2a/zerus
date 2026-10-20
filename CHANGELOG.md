@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.4](https://github.com/wcampbell0x2a/zerus/compare/v0.16.3...v0.16.4) - 2026-10-20
+
+### Other
+
+- Install musl-gcc in the mdbook workflow
+
 ## [0.16.3](https://github.com/wcampbell0x2a/zerus/compare/v0.16.2...v0.16.3) - 2026-10-20
 
 ### Added
