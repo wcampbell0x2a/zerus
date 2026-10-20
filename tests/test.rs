@@ -375,6 +375,8 @@ replace-with = "zerus"
             .args(args)
             .current_dir(&consumer)
             .env("CARGO_HOME", &cargo_home)
+            // Color codes go around the crate name, and the asserts cannot find it
+            .env("CARGO_TERM_COLOR", "never")
             .output()
             .unwrap();
         assert_success(&output);
