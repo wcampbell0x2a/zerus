@@ -991,6 +991,32 @@ impl Presence {
     }
 }
 
+/// Where a search found a crate
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Source<'a> {
+    /// In the manifest with this file name
+    Manifest(&'a str),
+    /// In the mirror, and in no manifest
+    Unmanifested,
+}
+
+impl<'a> Source<'a> {
+    /// The path of the listing that holds the crate
+    fn base(self) -> String {
+        match self {
+            Self::Manifest(file) => format!("/manifests/{file}"),
+            Self::Unmanifested => "/unmanifested".to_string(),
+        }
+    }
+
+    fn label(self) -> &'a str {
+        match self {
+            Self::Manifest(file) => file,
+            Self::Unmanifested => "(un-manifested)",
+        }
+    }
+}
+
 /// The part of a manifest and the page in it that hold the crate `focus` (`name@version`)
 fn locate(present: &[&Listed<'_>], culled: &[&Listed<'_>], focus: &str) -> Option<(Show, usize)> {
     let (name, version) = focus.split_once('@')?;
@@ -1710,7 +1736,8 @@ async fn unmanifested(
     blocking(move || unmanifested_page(&state, params)).await
 }
 
-fn unmanifested_page(state: &AppState, params: ListParams) -> Result<Markup, ErrorPage> {
+fn unmanifested_page(state: &AppState, mut params: ListParams) -> Result<Markup, ErrorPage> {
+    let focus = params.focus.take();
     // Every entry comes from a file in the mirror, so none of them can be culled.
     let view = ListParams {
         show: None,
@@ -1737,6 +1764,10 @@ fn unmanifested_page(state: &AppState, params: ListParams) -> Result<Markup, Err
 
     let listed = listing(crates, mirror, view.sort, view.dir);
     let all: Vec<&Listed<'_>> = listed.iter().collect();
+    let view = match focus.as_deref().and_then(|focus| locate(&all, &[], focus)) {
+        Some((_, page)) => view.with_page(page),
+        None => view,
+    };
 
     Ok(page(
         "un-manifested - zerus",
@@ -1803,14 +1834,25 @@ fn manifest_search_page(
         .filter_map(|file| Some((file.name.as_str(), file.crates.as_ref().ok()?)));
     let unparsed = files.iter().filter(|file| file.crates.is_err()).count();
 
-    let mut hits: Vec<(&Crate, &str)> = Vec::new();
+    let matches = |c: &&Crate| c.name.to_lowercase().contains(&needle);
+    let mut hits: Vec<(&Crate, Source<'_>)> = Vec::new();
     if !needle.is_empty() {
         for (file, crates) in parsed {
-            for c in crates {
-                if c.name.to_lowercase().contains(&needle) {
-                    hits.push((c, file));
-                }
-            }
+            hits.extend(
+                crates
+                    .iter()
+                    .filter(matches)
+                    .map(|c| (c, Source::Manifest(file))),
+            );
+        }
+        // A crate that is in the mirror and in no manifest is on the server too
+        if let Ok(crates) = &snapshot.unmanifested {
+            hits.extend(
+                crates
+                    .iter()
+                    .filter(matches)
+                    .map(|c| (c, Source::Unmanifested)),
+            );
         }
         hits.sort_unstable();
     }
@@ -1828,14 +1870,14 @@ fn manifest_search_page(
             @if query.is_empty() {
                 p.empty { "Enter a crate name." }
             } @else if hits.is_empty() {
-                p.empty { "No crate matching " code { (query) } " in any manifest." }
+                p.empty { "No crate matching " code { (query) } " in a manifest or in the mirror." }
             } @else {
                 table {
                     thead {
                         tr { th { "crate" } th { "version" } th { "status" } th { "manifest" } }
                     }
                     tbody {
-                        @for (krate, file) in &hits {
+                        @for (krate, source) in &hits {
                             @let presence = Presence::of(krate, &snapshot.mirror);
                             tr .culled[presence == Presence::Culled] {
                                 td { (krate.name) }
@@ -1843,9 +1885,9 @@ fn manifest_search_page(
                                 td { (presence.label()) }
                                 // Go to the row of this crate, on the page that holds it
                                 td { a href={
-                                    "/manifests/" (file) "?crate=" (encode_query(&row_id(krate)))
+                                    (source.base()) "?crate=" (encode_query(&row_id(krate)))
                                     "#" (row_id(krate))
-                                } { (file) } }
+                                } { (source.label()) } }
                             }
                         }
                     }
@@ -2149,6 +2191,44 @@ mod tests {
             Presence::Culled
         );
         assert_eq!(Presence::of(&krate, &Mirror::Failed), Presence::Unknown);
+    }
+
+    #[test]
+    fn search_finds_crates_in_the_mirror_that_no_manifest_records() {
+        let (_tmp, state) = clean_fixture();
+        add_crate(&state.mirror_path, "rand", "0.9.0");
+        rescan(&state);
+
+        let html = search(&state, "rand").unwrap();
+
+        assert!(
+            html.contains(concat!(
+                r#"<tr class=""><td>rand</td><td>0.9.0</td><td>in mirror</td>"#,
+                r#"<td><a href="/unmanifested?crate=rand%400.9.0#rand@0.9.0">(un-manifested)</a>"#
+            )),
+            "{html}"
+        );
+        let html = search(&state, "nothing-like-it").unwrap();
+        assert!(html.contains("in a manifest or in the mirror"), "{html}");
+    }
+
+    #[test]
+    fn an_unmanifested_crate_link_goes_to_its_page() {
+        let (_tmp, state) = clean_fixture();
+        for n in 0..PAGE_SIZE + 5 {
+            add_crate(&state.mirror_path, &format!("new{n:05}"), "1.0.0");
+        }
+        rescan(&state);
+        let last = format!("new{:05}", PAGE_SIZE + 4);
+
+        let html = render(unmanifested_page(
+            &state,
+            params(&format!("crate={last}%401.0.0")),
+        ))
+        .unwrap();
+
+        assert!(html.contains("page 2 of 2"), "{html}");
+        assert!(html.contains(&format!(r#"id="{last}@1.0.0">"#)), "{html}");
     }
 
     #[test]
