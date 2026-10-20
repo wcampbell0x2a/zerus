@@ -1365,7 +1365,7 @@ a.sort.active::after { content: ' \\2193'; }
 a.sort.active.reversed::after { content: ' \\2191'; }
 form.search, form.refresh { display: inline; }
 form.search { margin-left: auto; }
-.error { color: #c62828; }
+.error { color: light-dark(#c62828, #ef9a9a); }
 ";
 
 // `s` and `/` focus the search box, the same keys docs.rs binds. Ctrl+S is left alone so
