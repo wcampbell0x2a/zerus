@@ -859,6 +859,52 @@ fn split_culled<'a, 'b>(listed: &'b [Listed<'a>]) -> (Vec<&'b Listed<'a>>, Vec<&
     listed.iter().partition(|l| l.in_mirror())
 }
 
+/// Can this server serve a crate?
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Presence {
+    InMirror,
+    /// Transferred and then removed from the mirror, so this server cannot serve it
+    Culled,
+    /// The mirror scan failed
+    Unknown,
+}
+
+impl Presence {
+    fn of(krate: &Crate, mirror: &Mirror) -> Self {
+        match mirror {
+            Mirror::Read(mirror) if mirror.contains_key(krate) => Self::InMirror,
+            Mirror::Read(_) => Self::Culled,
+            Mirror::Failed => Self::Unknown,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::InMirror => "in mirror",
+            Self::Culled => "culled",
+            Self::Unknown => "not known",
+        }
+    }
+}
+
+/// The part of a manifest and the page in it that hold the crate `focus` (`name@version`)
+fn locate(present: &[&Listed<'_>], culled: &[&Listed<'_>], focus: &str) -> Option<(Show, usize)> {
+    let (name, version) = focus.split_once('@')?;
+    [(Show::Present, present), (Show::Culled, culled)]
+        .into_iter()
+        .find_map(|(show, rows)| {
+            let at = rows
+                .iter()
+                .position(|l| l.krate.name == name && l.krate.version == version)?;
+            Some((show, at / PAGE_SIZE + 1))
+        })
+}
+
+/// The id of the table row of a crate, so a link can go to it
+fn row_id(krate: &Crate) -> String {
+    format!("{}@{}", krate.name, krate.version)
+}
+
 /// One page of a listing
 #[derive(Debug, PartialEq, Eq)]
 struct Page<'a, T> {
@@ -897,6 +943,10 @@ struct ListParams {
     show: Option<Show>,
     #[serde(default, deserialize_with = "ignore_invalid")]
     page: Option<usize>,
+    /// A row to go to and mark, as `name@version`, e.g. from a search hit. It picks `show` and
+    /// `page`, so that the row is on the page.
+    #[serde(default, rename = "crate")]
+    focus: Option<String>,
 }
 
 fn ignore_invalid<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
@@ -996,7 +1046,7 @@ fn crate_table(rows: &[&Listed<'_>], view: View<'_>) -> Markup {
             }
             tbody {
                 @for l in rows {
-                    tr .culled[!l.in_mirror()] {
+                    tr id=(row_id(l.krate)) .culled[!l.in_mirror()] {
                         td { (l.krate.name) }
                         td { (l.krate.version) }
                         td.count {
@@ -1167,10 +1217,11 @@ button.link { font: inherit; color: inherit; background: none; border: 0; paddin
               text-decoration: underline; cursor: pointer; }
 table { border-collapse: collapse; width: 100%; }
 td, th { text-align: left; padding: .25rem .75rem .25rem 0; }
-th { border-bottom: 1px solid currentColor; }
+th { border-bottom: 1px solid currentColor; white-space: nowrap; }
 /* A fixed color, as `currentColor` would tint the line of an error cell */
 tr + tr td { border-top: 1px solid var(--line); }
 .culled { opacity: .55; }
+tr:target td { background: color-mix(in srgb, Highlight 30%, transparent); }
 .count { color: color-mix(in srgb, currentColor 65%, transparent); }
 td.num { font-variant-numeric: tabular-nums; }
 input[type=search] { font: inherit; padding: .3rem; min-width: 16rem; }
@@ -1453,9 +1504,10 @@ async fn manifest_detail(
 fn manifest_detail_page(
     state: &AppState,
     name: &str,
-    params: ListParams,
+    mut params: ListParams,
 ) -> Result<Markup, ErrorPage> {
     let base = format!("/manifests/{name}");
+    let focus = params.focus.take();
     let view = params.view(&base);
     let (scans, bar) = page_scans(state, &view.href())?;
     let snapshot = shown(&scans, &bar)?;
@@ -1496,6 +1548,13 @@ fn manifest_detail_page(
 
     let listed = listing(crates, mirror, view.sort, view.dir);
     let (present, culled) = split_culled(&listed);
+    let view = match focus
+        .as_deref()
+        .and_then(|focus| locate(&present, &culled, focus))
+    {
+        Some((show, page)) => view.with_show(show).with_page(page),
+        None => view,
+    };
 
     Ok(page(
         &format!("{name} - zerus"),
@@ -1640,12 +1699,12 @@ fn manifest_search_page(
         .filter_map(|file| Some((file.name.as_str(), file.crates.as_ref().ok()?)));
     let unparsed = files.iter().filter(|file| file.crates.is_err()).count();
 
-    let mut hits: Vec<(&str, &str, &str)> = Vec::new();
+    let mut hits: Vec<(&Crate, &str)> = Vec::new();
     if !needle.is_empty() {
         for (file, crates) in parsed {
             for c in crates {
                 if c.name.to_lowercase().contains(&needle) {
-                    hits.push((c.name.as_str(), c.version.as_str(), file));
+                    hits.push((c, file));
                 }
             }
         }
@@ -1668,13 +1727,21 @@ fn manifest_search_page(
                 p.empty { "No crate matching " code { (query) } " in any manifest." }
             } @else {
                 table {
-                    thead { tr { th { "crate" } th { "version" } th { "manifest" } } }
+                    thead {
+                        tr { th { "crate" } th { "version" } th { "status" } th { "manifest" } }
+                    }
                     tbody {
-                        @for (name, version, file) in &hits {
-                            tr {
-                                td { (name) }
-                                td { (version) }
-                                td { a href={ "/manifests/" (file) } { (file) } }
+                        @for (krate, file) in &hits {
+                            @let presence = Presence::of(krate, &snapshot.mirror);
+                            tr .culled[presence == Presence::Culled] {
+                                td { (krate.name) }
+                                td { (krate.version) }
+                                td { (presence.label()) }
+                                // Go to the row of this crate, on the page that holds it
+                                td { a href={
+                                    "/manifests/" (file) "?crate=" (encode_query(&row_id(krate)))
+                                    "#" (row_id(krate))
+                                } { (file) } }
                             }
                         }
                     }
@@ -1884,6 +1951,104 @@ mod tests {
             "{html}"
         );
         assert!(html.find("<td>tokio</td>") < html.find("<td>serde</td>"));
+    }
+
+    #[test]
+    fn a_crate_link_goes_to_its_part_and_page() {
+        let (_tmp, state) = fixture();
+
+        // `axum` is culled, so the link opens the culled part
+        let html = detail(&state, "a.txt", "crate=axum%400.8.1").unwrap();
+        assert!(
+            html.contains(r#"<tr class="culled" id="axum@0.8.1">"#),
+            "{html}"
+        );
+        assert!(html.contains("show still in mirror (2)"), "{html}");
+
+        let lines: String = (0..PAGE_SIZE + 5)
+            .map(|n| format!("gone{n:05}@1.0.0\n"))
+            .collect();
+        add_manifest(&state, "big.txt", &lines);
+        let last = format!("gone{PAGE_SIZE:05}");
+        let html = detail(&state, "big.txt", &format!("crate={last}%401.0.0")).unwrap();
+        assert!(html.contains("page 2 of 2"), "{html}");
+        assert!(html.contains(&format!(r#"id="{last}@1.0.0">"#)), "{html}");
+    }
+
+    #[test]
+    fn an_unknown_or_bad_crate_link_shows_the_usual_view() {
+        let (_tmp, state) = fixture();
+        let usual = detail(&state, "a.txt", "").unwrap();
+
+        for query in [
+            "crate=nope%401.0.0",
+            "crate=axum",
+            "crate=",
+            "crate=axum%400.0.0",
+        ] {
+            assert_eq!(detail(&state, "a.txt", query).unwrap(), usual, "{query}");
+        }
+    }
+
+    #[test]
+    fn search_tells_if_each_hit_is_in_the_mirror() {
+        let (_tmp, state) = clean_fixture();
+        add_manifest(&state, "b.txt", "axum@0.8.2\naxum@0.8.1\n");
+        add_crate(&state.mirror_path, "axum", "0.8.2");
+        rescan(&state);
+
+        let html = search(&state, "axum").unwrap();
+
+        assert!(
+            html.contains(r#"<tr class=""><td>axum</td><td>0.8.2</td><td>in mirror</td>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<tr class="culled"><td>axum</td><td>0.8.1</td><td>culled</td>"#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn search_with_a_failed_mirror_scan_does_not_say_culled() {
+        let (tmp, state) = clean_fixture();
+        let no_mirror = AppState::new(
+            tmp.path().join("nope"),
+            Some(manifests_dir(&state)),
+            Rescan::Never,
+        )
+        .unwrap();
+        rescan(&no_mirror);
+
+        let html = search(&no_mirror, "axum").unwrap();
+
+        assert!(html.contains("<td>not known</td>"), "{html}");
+        assert!(!html.contains(r#"<tr class="culled">"#), "{html}");
+    }
+
+    #[test]
+    fn presence_follows_the_mirror() {
+        let krate = Crate::new("serde".to_string(), "1.0.0".to_string());
+        let with = Mirror::Read(WriteTimes::from([(krate.clone(), SystemTime::UNIX_EPOCH)]));
+
+        assert_eq!(Presence::of(&krate, &with), Presence::InMirror);
+        assert_eq!(
+            Presence::of(&krate, &Mirror::Read(WriteTimes::new())),
+            Presence::Culled
+        );
+        assert_eq!(Presence::of(&krate, &Mirror::Failed), Presence::Unknown);
+    }
+
+    #[test]
+    fn search_links_go_to_the_row_of_the_crate() {
+        let (_tmp, state) = clean_fixture();
+
+        let html = search(&state, "axum").unwrap();
+
+        assert!(
+            html.contains(r#"<a href="/manifests/a.txt?crate=axum%400.8.1#axum@0.8.1">a.txt</a>"#),
+            "{html}"
+        );
     }
 
     #[test]
