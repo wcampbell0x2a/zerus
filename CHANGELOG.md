@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.2](https://github.com/wcampbell0x2a/zerus/compare/v0.16.1...v0.16.2) - 2026-10-20
+
 ### Added
 
 - `serve`: Cache mirror and manifest scans, and refresh them in the background. Pages show the age of the data
