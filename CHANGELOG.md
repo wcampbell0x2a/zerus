@@ -6,6 +6,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `serve`: Cache mirror and manifest scans, and refresh them in the background. Pages show the age of the data
+- `serve`: Add `--rescan-after` to rescan stale data on page load
+- `serve`: Page the manifest listings, and show in-mirror and culled counts for each manifest
+- `serve`: Search also finds crates that are in no manifest. Search hits link to their rows and show if they are culled
+- `serve`: Click a column header again to reverse the sort
+- Add `just demo`
+
+### Fixed
+
+- `serve`: Refuse crate and index paths outside the mirror. An encoded `..` in a request could read any file on the server
+- Write mirror, index, and manifest files atomically, so `serve` does not read a half-written file
+- Remove duplicate manifest entries
+
+### Changed
+
+- `serve`: Serve files off the async runtime, and cache the search API index until the next `update-index`
+- Use mimalloc in musl builds
+- Document `--dl-url`
+
 ## [0.16.1](https://github.com/wcampbell0x2a/zerus/compare/v0.16.0...v0.16.1) - 2026-09-06
 
 ### Added
