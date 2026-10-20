@@ -6,6 +6,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add a [book](https://wcampbell0x2a.github.io/zerus/) with the usage docs and screenshots of the web UI. The README is now short
+- Add `just book` and `just book-screenshots`
+
+### Fixed
+
+- `serve`: Make the error text of the web UI easy to read in dark mode
+
 ## [0.16.2](https://github.com/wcampbell0x2a/zerus/compare/v0.16.1...v0.16.2) - 2026-10-20
 
 ### Added

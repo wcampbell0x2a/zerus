@@ -15,3 +15,11 @@ test:
 demo port="3000":
     python3 scripts/demo.py target/demo
     cargo run -- serve target/demo/mirror --manifests target/demo/manifests --bind 127.0.0.1:{{port}}
+
+# Make the screenshots of the web UI for the book, from the `demo` mirror. Needs `firefox`.
+book-screenshots:
+    scripts/book-screenshots.sh book/src/images
+
+# Build the book with new screenshots. Needs `mdbook`.
+book: book-screenshots
+    mdbook build book
