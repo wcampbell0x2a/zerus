@@ -15,6 +15,7 @@ keywords = ["offline", "mirror", "crates", "download", "vendor"]
 clap = { version = "4.5.13", features = ["derive"] }
 reqwest = { version = "0.12.8", default-features = false, features = ["blocking", "rustls-tls", "http2"] }
 anyhow = "1.0.90"
+tempfile = "3.13.0"
 guppy = "0.17.5"
 rayon = "1.10.0"
 git2 = { version = "0.20.0", features = ["vendored-libgit2", "vendored-openssl"] }
@@ -42,7 +43,6 @@ mimalloc = "0.1"
 
 [dev-dependencies]
 assert_cmd = { version = "2.0.16", features = ["color", "color-auto"] }
-tempfile = "3.13.0"
 insta = "1.42.1"
 tower = { version = "0.5", features = ["util"] }
 

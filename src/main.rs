@@ -9,6 +9,7 @@ use tracing_subscriber::layer::{Layer, SubscriberExt};
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
+mod atomic;
 mod git;
 mod index;
 mod manifest;

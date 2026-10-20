@@ -50,7 +50,9 @@ pub fn write_manifest(crates: &[Crate], output: Option<&Path>) -> anyhow::Result
 
     match output {
         Some(path) => {
-            fs::write(path, buf).with_context(|| format!("failed to write {}", path.display()))?;
+            // A server that runs reads the manifests, so it must not see a half-written one
+            crate::atomic::write(path, buf)
+                .with_context(|| format!("failed to write {}", path.display()))?;
             info!("wrote {} crate(s) to {}", crates.len(), path.display());
         }
         None => {

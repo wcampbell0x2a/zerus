@@ -318,7 +318,7 @@ pub fn write_index_entries(index_path: &Path, new_entries: &[IndexEntry]) -> any
     } else {
         lines.join("\n") + "\n"
     };
-    fs::write(&index_file, content)
+    crate::atomic::write(&index_file, content)
         .with_context(|| format!("failed to write {}", index_file.display()))?;
 
     Ok(())
@@ -384,13 +384,10 @@ pub fn update_index(
 
     if let Some(url) = dl_url {
         let config_path = index_path.join("config.json");
-        let file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&config_path)
-            .with_context(|| format!("failed to create {}", config_path.display()))?;
-        crate::git::write_config_json(url, file).context("failed to write config.json")?;
+        let mut config = Vec::new();
+        crate::git::write_config_json(url, &mut config).context("failed to write config.json")?;
+        crate::atomic::write(&config_path, config)
+            .with_context(|| format!("failed to write {}", config_path.display()))?;
     } else if !index_path.join("config.json").exists() {
         warn!(
             "no config.json found in index and --dl-url not provided; the index will be unusable without it"
@@ -416,7 +413,7 @@ pub fn write_updated_marker(index_path: &Path) -> anyhow::Result<()> {
         .unwrap_or_default()
         .as_nanos();
     let path = index_path.join(UPDATED_MARKER);
-    fs::write(&path, format!("{nanos}\n"))
+    crate::atomic::write(&path, format!("{nanos}\n"))
         .with_context(|| format!("failed to write {}", path.display()))
 }
 
