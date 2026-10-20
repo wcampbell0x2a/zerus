@@ -175,7 +175,6 @@ enum Manifests {
 enum UnmanifestedUnknown {
     MirrorScanFailed,
     ManifestsUnreadable,
-    ManifestParseFailed,
 }
 
 impl UnmanifestedUnknown {
@@ -183,9 +182,6 @@ impl UnmanifestedUnknown {
         match self {
             Self::MirrorScanFailed => "the last scan could not read the mirror",
             Self::ManifestsUnreadable => "the last scan could not read the manifests directory",
-            Self::ManifestParseFailed => {
-                "a manifest did not parse, so the crates that it records are not known"
-            }
         }
     }
 }
@@ -197,6 +193,9 @@ struct Snapshot {
     /// Mirror crates that no manifest records, in name order. The scan finds them once, so
     /// that each load of the manifest list does not compare every manifest with the mirror.
     unmanifested: Result<Vec<Crate>, UnmanifestedUnknown>,
+    /// For each manifest that parsed, how many of its crates are still in the mirror. Empty
+    /// when the mirror scan failed. The scan counts them once, for the same reason.
+    in_mirror: HashMap<String, usize>,
     /// When the scan started. Changes to the disk after this time can be missing.
     started: SystemTime,
     took: Duration,
@@ -224,6 +223,7 @@ impl Snapshot {
         };
         let manifests = read_manifests(manifests_path);
         let unmanifested = find_unmanifested(&mirror, &manifests);
+        let in_mirror = count_in_mirror(&mirror, &manifests);
 
         let took = clock.elapsed();
         info!("scan done in {took:.1?}");
@@ -232,14 +232,40 @@ impl Snapshot {
             mirror,
             manifests,
             unmanifested,
+            in_mirror,
             started,
             took,
         }
     }
 }
 
-/// Mirror crates that no manifest records. This is known only when the scan read the mirror
-/// and every manifest.
+impl Snapshot {
+    /// How many manifest files did not parse
+    fn unparsed(&self) -> usize {
+        match &self.manifests {
+            Manifests::Unreadable => 0,
+            Manifests::Files(files) => files.iter().filter(|file| file.crates.is_err()).count(),
+        }
+    }
+}
+
+/// Tells that the un-manifested list can hold crates that the `unparsed` bad files record
+fn unparsed_warning(unparsed: usize) -> Markup {
+    html! {
+        @if unparsed > 0 {
+            p.error {
+                (unparsed) " manifest(s) did not parse, so the un-manifested crates can include "
+                "crates that they record. Correct the file(s), then click Refresh."
+            }
+        }
+    }
+}
+
+/// Mirror crates that no manifest that parsed records. This is known only when the scan read
+/// the mirror and listed the manifests.
+///
+/// A manifest that did not parse does not hide the list: the list is the next transfer, so it
+/// is better to show too many crates than none. The pages tell the user about the bad file.
 fn find_unmanifested(
     mirror: &Mirror,
     manifests: &Manifests,
@@ -252,16 +278,28 @@ fn find_unmanifested(
     };
     let recorded = files
         .iter()
-        .map(|file| file.crates.as_ref())
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| UnmanifestedUnknown::ManifestParseFailed)?;
+        .filter_map(|file| file.crates.as_ref().ok())
+        .flatten();
 
-    Ok(
-        manifest::unmanifested(mirror.keys(), recorded.into_iter().flatten())
-            .into_iter()
-            .cloned()
-            .collect(),
-    )
+    Ok(manifest::unmanifested(mirror.keys(), recorded)
+        .into_iter()
+        .cloned()
+        .collect())
+}
+
+/// For each manifest that parsed, how many of its crates are still in the mirror
+fn count_in_mirror(mirror: &Mirror, manifests: &Manifests) -> HashMap<String, usize> {
+    let (Mirror::Read(mirror), Manifests::Files(files)) = (mirror, manifests) else {
+        return HashMap::new();
+    };
+    files
+        .par_iter()
+        .filter_map(|file| {
+            let crates = file.crates.as_ref().ok()?;
+            let present = crates.iter().filter(|c| mirror.contains_key(*c)).count();
+            Some((file.name.clone(), present))
+        })
+        .collect()
 }
 
 /// Find every `.crate` file in the mirror and read its write time
@@ -499,6 +537,20 @@ fn ago(then: SystemTime, now: SystemTime) -> String {
         3600..=86_399 => format!("{} h ago", secs / 3600),
         _ => format!("{} d ago", secs / 86_400),
     }
+}
+
+/// `n` with its digits in groups of three, e.g. `1,234,567`, so that large counts are easy
+/// to read
+fn grouped(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
 }
 
 /// Does the page reload itself?
@@ -849,7 +901,7 @@ fn pager<T>(page: &Page<'_, T>, view: View<'_>) -> Markup {
                     a href=(view.with_page(1).href()) { "first" }
                     a href=(view.with_page(page.number - 1).href()) { "prev" }
                 }
-                span.count { "page " (page.number) " of " (page.count) }
+                span.count { "page " (grouped(page.number)) " of " (grouped(page.count)) }
                 @if page.number < page.count {
                     a href=(view.with_page(page.number + 1).href()) { "next" }
                     a href=(view.with_page(page.count).href()) { "last" }
@@ -946,6 +998,7 @@ th { border-bottom: 1px solid currentColor; }
 tr + tr td { border-top: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
 .culled { opacity: .55; }
 .count { color: color-mix(in srgb, currentColor 65%, transparent); }
+td.num { font-variant-numeric: tabular-nums; }
 input[type=search] { font: inherit; padding: .3rem; min-width: 16rem; }
 p.empty { color: color-mix(in srgb, currentColor 65%, transparent); }
 p.crumbs { margin-bottom: 0; }
@@ -1111,22 +1164,48 @@ fn manifests_index_page(state: &AppState) -> Result<Markup, ErrorPage> {
         html! {
             h1 { "Manifests" }
             table {
-                thead { tr { th { "manifest" } th { "crates" } } }
+                thead {
+                    tr {
+                        th { "manifest" }
+                        th.num { "crates" }
+                        th.num { "in mirror" }
+                        th.num { "culled" }
+                    }
+                }
                 tbody {
                     tr {
                         td { a href="/unmanifested" { "(un-manifested)" } }
                         @match &snapshot.unmanifested {
-                            Ok(crates) => td.count { (crates.len()) },
-                            Err(_) => td.error { "not known" },
+                            // Every un-manifested crate is in the mirror, as the mirror is where
+                            // the scan found it, so none is culled
+                            Ok(crates) => {
+                                td.num { (grouped(crates.len())) }
+                                td.num { (grouped(crates.len())) }
+                                td {}
+                            }
+                            Err(_) => td.error colspan="3" { "not known" },
                         }
                     }
                     // Newest first, for names that start with the date, as the README shows
                     @for file in files.iter().rev() {
                         tr {
                             td { a href={ "/manifests/" (file.name) } { (file.name) } }
-                            @match &file.crates {
-                                Ok(crates) => td.count { (crates.len()) },
-                                Err(_) => td.error { "did not parse" },
+                            @match (&file.crates, snapshot.in_mirror.get(&file.name)) {
+                                (Err(_), _) => td.error colspan="3" { "did not parse" },
+                                (Ok(crates), Some(&present)) => {
+                                    td.num { (grouped(crates.len())) }
+                                    td.num { (grouped(present)) }
+                                    // Most manifests have no culled crates, so a 0 is only noise
+                                    td.num {
+                                        @if crates.len() > present {
+                                            (grouped(crates.len() - present))
+                                        }
+                                    }
+                                }
+                                (Ok(crates), None) => {
+                                    td.num { (grouped(crates.len())) }
+                                    td.error colspan="2" { "not known" }
+                                }
                             }
                         }
                     }
@@ -1138,6 +1217,7 @@ fn manifests_index_page(state: &AppState) -> Result<Markup, ErrorPage> {
             @if let Err(why) = snapshot.unmanifested {
                 p.error { "The un-manifested count is not known: " (why.reason()) "." }
             }
+            (unparsed_warning(snapshot.unparsed()))
         },
     ))
 }
@@ -1224,14 +1304,18 @@ fn manifest_detail_page(
             p.crumbs { a href="/" { "manifests" } " /" }
             h1 { (name) }
             p.count {
-                (listed.len()) " crate(s), " (present.len()) " still in mirror, "
-                (culled.len()) " culled"
+                (grouped(listed.len())) " crate(s)"
+                // The split only tells something when a crate was culled
+                @if !culled.is_empty() {
+                    ", " (grouped(present.len())) " still in mirror, "
+                    (grouped(culled.len())) " culled"
+                }
             }
             @match view.show {
                 Show::Present => {
                     @if !culled.is_empty() {
                         p { a href=(view.with_show(Show::Culled).href()) {
-                            "show culled (" (culled.len()) ")"
+                            "show culled (" (grouped(culled.len())) ")"
                         } }
                     }
                     @if present.is_empty() {
@@ -1242,7 +1326,7 @@ fn manifest_detail_page(
                 }
                 Show::Culled => {
                     p { a href=(view.with_show(Show::Present).href()) {
-                        "show still in mirror (" (present.len()) ")"
+                        "show still in mirror (" (grouped(present.len())) ")"
                     } }
                     @if culled.is_empty() {
                         p.empty { "No crate in this manifest was culled." }
@@ -1297,7 +1381,8 @@ fn unmanifested_page(state: &AppState, params: ListParams) -> Result<Markup, Err
         html! {
             p.crumbs { a href="/" { "manifests" } " /" }
             h1 { "Un-manifested" }
-            p.count { (all.len()) " crate(s) in the mirror that no manifest records" }
+            p.count { (grouped(all.len())) " crate(s) in the mirror that no manifest records" }
+            (unparsed_warning(snapshot.unparsed()))
             @if all.is_empty() {
                 p.empty { "Every crate in the mirror is in a manifest." }
             } @else {
@@ -1637,6 +1722,114 @@ mod tests {
     fn add_manifest(state: &AppState, name: &str, contents: &str) {
         fs::write(manifests_dir(state).join(name), contents).unwrap();
         rescan(state);
+    }
+
+    /// The cell texts of the table row whose link reads `label`
+    fn row(html: &str, label: &str) -> Vec<String> {
+        let start = html
+            .find(&format!(">{label}</a>"))
+            .unwrap_or_else(|| panic!("no row {label}: {html}"));
+        let start = html[..start].rfind("<tr>").unwrap();
+        let end = start + html[start..].find("</tr>").unwrap();
+        html[start..end]
+            .split("</td>")
+            .filter(|cell| cell.contains("<td"))
+            .map(|cell| {
+                // Drop the tags and keep the text between them
+                let mut text = String::new();
+                let mut in_tag = false;
+                for c in cell.chars() {
+                    match c {
+                        '<' => in_tag = true,
+                        '>' => in_tag = false,
+                        _ if !in_tag => text.push(c),
+                        _ => {}
+                    }
+                }
+                text
+            })
+            .collect()
+    }
+
+    #[test]
+    fn grouped_puts_a_comma_between_groups_of_three() {
+        for (n, text) in [
+            (0, "0"),
+            (999, "999"),
+            (1000, "1,000"),
+            (123_456, "123,456"),
+            (1_234_567, "1,234,567"),
+        ] {
+            assert_eq!(grouped(n), text);
+        }
+    }
+
+    /// Model check: for many lengths, the digits stay the same and every group after the
+    /// first has three digits
+    #[test]
+    fn grouped_keeps_the_digits_in_groups_of_three() {
+        let samples = (0..20).flat_map(|p| {
+            let base = 10usize.pow(p.min(19));
+            [base - 1, base, base + 1]
+        });
+        for n in samples.chain([usize::MAX]) {
+            let text = grouped(n);
+            assert_eq!(text.replace(',', ""), n.to_string(), "{n}");
+            let groups: Vec<&str> = text.split(',').collect();
+            assert!((1..=3).contains(&groups[0].len()), "{text}");
+            assert!(groups[1..].iter().all(|g| g.len() == 3), "{text}");
+        }
+    }
+
+    #[test]
+    fn manifest_list_marks_the_culled_count_of_each_manifest() {
+        let (_tmp, state) = clean_fixture();
+        add_manifest(
+            &state,
+            "b.txt",
+            "axum@0.8.1
+serde@1.0.210
+",
+        );
+
+        let list = index(&state).unwrap();
+
+        assert_eq!(row(&list, "b.txt"), ["b.txt", "2", "1", "1"]);
+        assert!(list.contains(r#"<th class="num">culled</th>"#), "{list}");
+    }
+
+    #[test]
+    fn a_manifest_with_nothing_culled_does_not_mention_culled() {
+        let (_tmp, state) = clean_fixture();
+        add_manifest(&state, "b.txt", "serde@1.0.210\ntokio@1.40.0\n");
+
+        assert_eq!(
+            row(&index(&state).unwrap(), "b.txt"),
+            ["b.txt", "2", "2", ""]
+        );
+        let html = detail(&state, "b.txt", "").unwrap();
+        assert!(
+            html.contains(r#"<p class="count">2 crate(s)</p>"#),
+            "{html}"
+        );
+        // The CSS has a `culled` class, so look at the body only
+        let body = html.split("<main>").nth(1).unwrap();
+        assert!(!body.contains("culled"), "{body}");
+    }
+
+    #[test]
+    fn large_counts_are_grouped() {
+        let (_tmp, state) = clean_fixture();
+        let lines: String = (0..1234).map(|n| format!("gone{n:05}@1.0.0\n")).collect();
+        add_manifest(&state, "big.txt", &lines);
+
+        let list = index(&state).unwrap();
+        assert_eq!(row(&list, "big.txt"), ["big.txt", "1,234", "0", "1,234"]);
+        let html = detail(&state, "big.txt", "").unwrap();
+        assert!(
+            html.contains("1,234 crate(s), 0 still in mirror, 1,234 culled"),
+            "{html}"
+        );
     }
 
     fn render(page: Result<Markup, ErrorPage>) -> Result<String, StatusCode> {
@@ -2131,17 +2324,17 @@ mod tests {
             list.contains(r#"<a href="/manifests/a.txt">a.txt</a>"#),
             "{list}"
         );
-        assert!(list.contains(r#"<td class="count">3</td>"#), "{list}");
+        assert_eq!(row(&list, "a.txt"), ["a.txt", "3", "2", "1"]);
+        assert_eq!(row(&list, "broken.txt"), ["broken.txt", "did not parse"]);
+        // `a.txt` records both mirror crates. `broken.txt` does not hide the count.
+        assert_eq!(
+            row(&list, "(un-manifested)"),
+            ["(un-manifested)", "0", "0", ""]
+        );
         assert!(
-            list.contains(r#"<td class="error">did not parse</td>"#),
+            list.contains("1 manifest(s) did not parse, so the un-manifested crates can include"),
             "{list}"
         );
-        // `broken.txt` can record any crate, so the un-manifested ones are not known
-        assert!(
-            list.contains(r#"<td class="error">not known</td>"#),
-            "{list}"
-        );
-        assert!(list.contains("a manifest did not parse"), "{list}");
     }
 
     #[test]
@@ -2155,9 +2348,12 @@ mod tests {
             list.contains(r#"<a href="/manifests/a.txt">a.txt</a>"#),
             "{list}"
         );
-        assert!(list.contains(r#"<td class="count">2</td>"#), "{list}");
+        assert_eq!(row(&list, "a.txt"), ["a.txt", "2", "1", "1"]);
         // `tokio` is in the mirror but in no manifest
-        assert!(list.contains(r#"<td class="count">1</td>"#), "{list}");
+        assert_eq!(
+            row(&list, "(un-manifested)"),
+            ["(un-manifested)", "1", "1", ""]
+        );
         assert!(!list.contains("not known"), "{list}");
     }
 
@@ -2217,15 +2413,17 @@ mod tests {
         assert!(html.contains("Mirror scan failed"), "{html}");
 
         let list = index(&no_mirror).unwrap();
-        assert!(
-            list.contains(r#"<td class="error">not known</td>"#),
-            "{list}"
+        assert_eq!(
+            row(&list, "(un-manifested)"),
+            ["(un-manifested)", "not known"]
         );
+        // The crate count comes from the manifest alone, so it is still known
+        assert_eq!(row(&list, "a.txt"), ["a.txt", "3", "not known"]);
         assert!(list.contains("could not read the mirror"), "{list}");
     }
 
     #[test]
-    fn find_unmanifested_is_known_only_after_a_full_read() {
+    fn find_unmanifested_needs_the_mirror_and_the_manifest_list() {
         let mirror = || {
             Mirror::Read(WriteTimes::from([(
                 Crate::new("serde".to_string(), "1.0.210".to_string()),
@@ -2245,12 +2443,14 @@ mod tests {
             find_unmanifested(&mirror(), &Manifests::Unreadable),
             Err(UnmanifestedUnknown::ManifestsUnreadable)
         );
+        // A bad file does not hide the list. It records nothing that is known.
         assert_eq!(
             find_unmanifested(
                 &mirror(),
                 &Manifests::Files(vec![file(Err(anyhow::anyhow!("bad")))])
-            ),
-            Err(UnmanifestedUnknown::ManifestParseFailed)
+            )
+            .unwrap(),
+            [Crate::new("serde".to_string(), "1.0.210".to_string())]
         );
         assert_eq!(
             find_unmanifested(&mirror(), &Manifests::Files(vec![file(Ok(vec![]))])).unwrap(),
@@ -2276,6 +2476,19 @@ mod tests {
         assert!(last.contains("page 2 of 2"));
         assert!(last.contains(&format!("<td>gone{PAGE_SIZE:05}</td>")));
         assert!(!last.contains("<td>gone00000</td>"));
+    }
+
+    #[test]
+    fn unmanifested_lists_crates_despite_a_bad_manifest() {
+        let (_tmp, state) = fixture();
+        add_manifest(&state, "a.txt", "serde@1.0.210\n");
+
+        let html = render(unmanifested_page(&state, params(""))).unwrap();
+
+        assert!(html.contains("<td>tokio</td>"), "{html}");
+        assert!(!html.contains("<td>serde</td>"), "{html}");
+        assert!(html.contains("1 manifest(s) did not parse"), "{html}");
+        assert_eq!(row(&index(&state).unwrap(), "(un-manifested)")[1], "1");
     }
 
     #[test]
