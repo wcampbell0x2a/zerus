@@ -397,7 +397,52 @@ pub fn update_index(
         );
     }
 
+    write_updated_marker(index_path)?;
     info!("index updated at {}", index_path.display());
 
     Ok(())
+}
+
+/// The file that `update_index` writes last. The server reads it to know that the index
+/// changed, as the index has no other file that each update writes. A dotfile, so that
+/// nothing takes it for the index file of a crate.
+pub const UPDATED_MARKER: &str = ".zerus-updated";
+
+/// Write a new value to the marker. The value is the time in nanoseconds, so that two updates
+/// in the same second still give two values: some disks keep write times only to the second.
+pub fn write_updated_marker(index_path: &Path) -> anyhow::Result<()> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = index_path.join(UPDATED_MARKER);
+    fs::write(&path, format!("{nanos}\n"))
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_index_writes_a_new_marker_each_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = tmp.path().join("crates.io-index");
+        let crates = tmp.path().join("crates");
+        fs::create_dir(&crates).unwrap();
+        let marker = || fs::read_to_string(index.join(UPDATED_MARKER)).unwrap();
+
+        update_index(&index, &crates, None).unwrap();
+        let first = marker();
+        update_index(&index, &crates, None).unwrap();
+
+        assert!(!first.trim().is_empty());
+        assert_ne!(marker(), first);
+    }
+
+    #[test]
+    fn write_updated_marker_fails_on_a_missing_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(write_updated_marker(&tmp.path().join("nope")).is_err());
+    }
 }

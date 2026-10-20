@@ -132,3 +132,8 @@ With the `registries` entry, you can search the mirror:
 ```console
 $ cargo search --registry zerus serde
 ```
+
+The server reads the index for the search when it starts, and keeps it in memory. Each run of
+`update-index` writes a marker file, `crates.io-index/.zerus-updated`, so the next search reads
+the index again and finds the new crates. For an index with no marker, e.g. from an older zerus,
+the search reads the index again when it is older than `--rescan-after`.

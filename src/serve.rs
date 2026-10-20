@@ -19,7 +19,7 @@ use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
 use crate::get_crate_path;
-use crate::index::{extract_cargo_toml, IndexEntry};
+use crate::index::{self, extract_cargo_toml, IndexEntry};
 use crate::manifest::{self, ParsedFile};
 use crate::Crate;
 
@@ -27,6 +27,10 @@ struct AppState {
     mirror_path: PathBuf,
     /// The manifest pages, if `--manifests` was given
     browse: Option<Arc<Browse>>,
+    /// The index as the search API last read it, or `None` before the first read. Held while
+    /// a read runs, so many searches at the same time read the index only once.
+    api_index: Mutex<Option<Arc<ApiIndex>>>,
+    rescan: Rescan,
 }
 
 impl AppState {
@@ -42,8 +46,77 @@ impl AppState {
         Ok(Self {
             mirror_path,
             browse,
+            api_index: Mutex::new(None),
+            rescan,
         })
     }
+
+    fn index_path(&self) -> PathBuf {
+        self.mirror_path.join("crates.io-index")
+    }
+
+    /// The index for the search API. On a network mount, a read of the whole index takes
+    /// one round trip per crate, so the index is read again only when it changed.
+    fn api_index(&self) -> Arc<ApiIndex> {
+        let index_path = self.index_path();
+        let mut cached = self
+            .api_index
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // Read the marker before the index. If an update runs during the read, the next
+        // search sees a new marker and reads the index again.
+        let marker = read_updated_marker(&index_path);
+        if let Some(index) = cached
+            .as_ref()
+            .filter(|index| !index.is_stale(marker.as_deref(), self.rescan, Instant::now()))
+        {
+            return Arc::clone(index);
+        }
+
+        let clock = Instant::now();
+        let fresh = Arc::new(ApiIndex {
+            latest: scan_index(&index_path),
+            marker,
+            read_at: Instant::now(),
+        });
+        info!(
+            "read {} crate(s) from the index for the search API in {:.1?}",
+            fresh.latest.len(),
+            clock.elapsed()
+        );
+        *cached = Some(Arc::clone(&fresh));
+        fresh
+    }
+}
+
+/// The index as the search API reads it
+struct ApiIndex {
+    /// The latest version of each crate
+    latest: HashMap<String, String>,
+    /// The marker that `update-index` wrote, as it was before the read, or `None` if the
+    /// index has no marker, e.g. as an older zerus wrote it
+    marker: Option<String>,
+    read_at: Instant,
+}
+
+impl ApiIndex {
+    /// Must the index be read again, with `marker` on the disk at `now`?
+    fn is_stale(&self, marker: Option<&str>, rescan: Rescan, now: Instant) -> bool {
+        if marker != self.marker.as_deref() {
+            return true;
+        }
+        match (marker, rescan) {
+            // Each update writes a new marker, so the same marker means the same index
+            (Some(_), _) | (None, Rescan::Never) => false,
+            // With no marker, nothing tells that the index changed, so use its age
+            (None, Rescan::After(limit)) => now.duration_since(self.read_at) >= limit,
+        }
+    }
+}
+
+/// The marker that `update-index` writes last, or `None` if there is none
+fn read_updated_marker(index_path: &Path) -> Option<String> {
+    std::fs::read_to_string(index_path.join(index::UPDATED_MARKER)).ok()
 }
 
 /// When a page load starts a scan on its own
@@ -450,7 +523,13 @@ fn scan_index_recursive(dir: &Path, crates: &mut HashMap<String, String>) {
             continue;
         }
 
-        if path.is_dir() {
+        // The directory listing gives the type, so most entries need no stat, which is a
+        // round trip on a network mount. A symlink still needs a stat.
+        let is_dir = match entry.file_type() {
+            Ok(file_type) if !file_type.is_symlink() => file_type.is_dir(),
+            _ => path.is_dir(),
+        };
+        if is_dir {
             scan_index_recursive(&path, crates);
         } else {
             // Each file is a crate index file with one JSON entry per line
@@ -485,17 +564,28 @@ fn scan_index_recursive(dir: &Path, crates: &mut HashMap<String, String>) {
     }
 }
 
+/// The crates.io search API, which `cargo search` uses
 async fn search(
     State(state): State<Arc<AppState>>,
     Query(params): Query<SearchParams>,
-) -> impl IntoResponse {
+) -> Result<Json<SearchResponse>, StatusCode> {
+    // A read of the index or of the `.crate` files can be slow on a network mount
+    tokio::task::spawn_blocking(move || search_index(&state, params))
+        .await
+        .map(Json)
+        .map_err(|e| {
+            warn!("search task failed: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+fn search_index(state: &AppState, params: SearchParams) -> SearchResponse {
     let query = params.q.unwrap_or_default().to_lowercase();
     let per_page = params.per_page.unwrap_or(10).min(100);
 
-    let index_path = state.mirror_path.join("crates.io-index");
-    let crates = scan_index(&index_path);
-
-    let mut matches: Vec<(&String, &String)> = crates
+    let index = state.api_index();
+    let mut matches: Vec<(&String, &String)> = index
+        .latest
         .iter()
         .filter(|(name, _)| query.is_empty() || name.to_lowercase().contains(&query))
         .collect();
@@ -534,10 +624,10 @@ async fn search(
         })
         .collect();
 
-    Json(SearchResponse {
+    SearchResponse {
         crates: results,
         meta: SearchMeta { total },
-    })
+    }
 }
 
 /// `path` under `root`, or `None` if `path` can get out of `root`. Only plain names are
@@ -552,23 +642,28 @@ fn path_under(root: &Path, path: &str) -> Option<PathBuf> {
 
 /// The file at `path` under `root`. A path that can get out of `root` gets the same 404 as
 /// a missing file, so a request cannot find out which files exist outside the mirror.
-fn read_under(root: &Path, path: &str) -> Result<Vec<u8>, StatusCode> {
+///
+/// The read runs off the async runtime: on a network mount, a slow read there would stall
+/// every other request, also the downloads of other cargo clients.
+async fn read_under(root: &Path, path: &str) -> Result<Vec<u8>, StatusCode> {
     let file = path_under(root, path).ok_or(StatusCode::NOT_FOUND)?;
-    std::fs::read(file).map_err(|_| StatusCode::NOT_FOUND)
+    tokio::fs::read(file)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)
 }
 
 async fn serve_crate_file(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(path): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    read_under(&state.mirror_path.join("crates"), &path)
+    read_under(&state.mirror_path.join("crates"), &path).await
 }
 
 async fn serve_index_file(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(path): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    read_under(&state.mirror_path.join("crates.io-index"), &path)
+    read_under(&state.mirror_path.join("crates.io-index"), &path).await
 }
 
 /// Modification time of the `.crate` file, or `None` if it is not in the mirror.
@@ -1789,6 +1884,14 @@ pub fn serve(
             .start_scan()
             .context("failed to start the first scan")?;
     }
+    // Read the index for the search API now, so the first `cargo search` need not wait
+    let warm = Arc::clone(&state);
+    std::thread::Builder::new()
+        .name("index-read".to_string())
+        .spawn(move || {
+            warm.api_index();
+        })
+        .context("failed to start the read of the index")?;
 
     let app = router(state);
     let rt = tokio::runtime::Runtime::new()?;
@@ -2171,6 +2274,145 @@ mod tests {
             assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
             assert!(body.is_empty(), "{uri}");
         }
+    }
+
+    /// Add a version of a crate to the index, as `update-index` would write it
+    fn add_index_entry(mirror: &Path, name: &str, version: &str) {
+        let file = mirror
+            .join("crates.io-index")
+            .join(crate::get_index_prefix(name).unwrap())
+            .join(name);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let entry = format!(
+            r#"{{"name":"{name}","vers":"{version}","deps":[],"cksum":"x","features":{{}},"yanked":false}}"#
+        );
+        let old = fs::read_to_string(&file).unwrap_or_default();
+        fs::write(&file, format!("{old}{entry}\n")).unwrap();
+    }
+
+    fn api_names(state: &AppState, q: &str) -> Vec<(String, String)> {
+        let response = search_index(
+            state,
+            SearchParams {
+                q: Some(q.to_string()),
+                per_page: Some(100),
+            },
+        );
+        response
+            .crates
+            .into_iter()
+            .map(|c| (c.name, c.max_version))
+            .collect()
+    }
+
+    #[test]
+    fn api_search_finds_a_crate_added_by_a_later_update_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mirror = tmp.path().join("mirror");
+        add_index_entry(&mirror, "serde", "1.0.210");
+        index::write_updated_marker(&mirror.join("crates.io-index")).unwrap();
+        // `Never`, so only the marker can tell that the index changed
+        let state = AppState::new(mirror.clone(), None, Rescan::Never).unwrap();
+
+        assert_eq!(
+            api_names(&state, "serde"),
+            [("serde".into(), "1.0.210".into())]
+        );
+        assert!(api_names(&state, "tokio").is_empty());
+
+        add_index_entry(&mirror, "tokio", "1.40.0");
+        add_index_entry(&mirror, "serde", "1.0.211");
+        index::write_updated_marker(&mirror.join("crates.io-index")).unwrap();
+
+        assert_eq!(
+            api_names(&state, "tokio"),
+            [("tokio".into(), "1.40.0".into())]
+        );
+        assert_eq!(
+            api_names(&state, "serde"),
+            [("serde".into(), "1.0.211".into())]
+        );
+    }
+
+    #[test]
+    fn api_search_uses_the_cache_while_the_marker_is_the_same() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mirror = tmp.path().join("mirror");
+        add_index_entry(&mirror, "serde", "1.0.210");
+        index::write_updated_marker(&mirror.join("crates.io-index")).unwrap();
+        let state = AppState::new(mirror.clone(), None, Rescan::After(Duration::ZERO)).unwrap();
+        api_names(&state, "serde");
+        let first = Arc::clone(state.api_index.lock().unwrap().as_ref().unwrap());
+
+        // A change with no new marker is not an update by `update-index`
+        add_index_entry(&mirror, "tokio", "1.40.0");
+
+        assert!(api_names(&state, "tokio").is_empty());
+        assert!(Arc::ptr_eq(&first, &state.api_index()));
+    }
+
+    #[test]
+    fn api_search_with_no_marker_reads_the_index_again_by_age() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mirror = tmp.path().join("mirror");
+        add_index_entry(&mirror, "serde", "1.0.210");
+        let never = AppState::new(mirror.clone(), None, Rescan::Never).unwrap();
+        let soon = AppState::new(
+            mirror.clone(),
+            None,
+            Rescan::After(Duration::from_millis(1)),
+        )
+        .unwrap();
+        api_names(&never, "x");
+        api_names(&soon, "x");
+
+        add_index_entry(&mirror, "tokio", "1.40.0");
+        std::thread::sleep(Duration::from_millis(5));
+
+        assert!(api_names(&never, "tokio").is_empty());
+        assert_eq!(
+            api_names(&soon, "tokio"),
+            [("tokio".into(), "1.40.0".into())]
+        );
+    }
+
+    #[test]
+    fn api_index_is_stale_when_the_marker_changes_or_with_no_marker_by_age() {
+        let read_at = Instant::now();
+        let index = |marker: Option<&str>| ApiIndex {
+            latest: HashMap::new(),
+            marker: marker.map(str::to_string),
+            read_at,
+        };
+        let later = read_at + Duration::from_secs(600);
+        let ten_min = Rescan::After(Duration::from_secs(600));
+
+        assert!(!index(Some("1")).is_stale(Some("1"), ten_min, later));
+        assert!(index(Some("1")).is_stale(Some("2"), Rescan::Never, read_at));
+        assert!(index(Some("1")).is_stale(None, Rescan::Never, read_at));
+        assert!(index(None).is_stale(Some("1"), Rescan::Never, read_at));
+        assert!(!index(None).is_stale(None, Rescan::Never, later));
+        assert!(!index(None).is_stale(None, ten_min, later - Duration::from_secs(1)));
+        assert!(index(None).is_stale(None, ten_min, later));
+    }
+
+    #[tokio::test]
+    async fn api_search_answers_through_the_router() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mirror = tmp.path().join("mirror");
+        add_index_entry(&mirror, "serde", "1.0.210");
+        add_index_entry(&mirror, "serde_json", "1.0.0");
+        index::write_updated_marker(&mirror.join("crates.io-index")).unwrap();
+        let state = AppState::new(mirror, None, Rescan::Never).unwrap();
+
+        let (status, body) = get(state, "/api/v1/crates?q=serde&per_page=1").await;
+
+        assert_eq!(status, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["meta"]["total"], 2);
+        assert_eq!(json["crates"][0]["name"], "serde");
+        // The marker is a dotfile, so it is not a crate
+        assert!(!String::from_utf8(body).unwrap().contains("zerus-updated"));
     }
 
     #[test]
