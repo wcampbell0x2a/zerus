@@ -6,9 +6,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.3](https://github.com/wcampbell0x2a/zerus/compare/v0.16.2...v0.16.3) - 2026-10-20
+
 ### Added
 
-- Add a [book](https://wcampbell0x2a.github.io/zerus/) with the usage docs and screenshots of the web UI. The README is now short
+- Add a [book](https://wcampbell0x2a.github.io/zerus/) with the usage docs and screenshots of the web UI. The README is now short.
 - Add `just book` and `just book-screenshots`
 
 ### Fixed
