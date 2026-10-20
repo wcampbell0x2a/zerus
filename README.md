@@ -112,6 +112,9 @@ Set the age with `--rescan-after`, e.g. `30s` or `1h`. Use `0` so that only Refr
 $ zerus serve new-mirror --manifests manifests/ --rescan-after 1h
 ```
 
+To try the web UI, `just demo` makes a demo mirror with five transfers in `target/demo` and
+serves it at `http://127.0.0.1:3000`. Pass another port with `just demo 8000`.
+
 ### Build with mirror
 Add the following to `.cargo/config.toml` (replacing `[IP]` with your server address).
 ```toml
