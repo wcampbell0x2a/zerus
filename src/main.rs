@@ -9,11 +9,17 @@ use tracing_subscriber::layer::{Layer, SubscriberExt};
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
+mod atomic;
 mod git;
 mod index;
 mod manifest;
 mod mirror;
 mod serve;
+
+// See the note on the mimalloc dependency in Cargo.toml
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn validate_url(url: &str) -> Result<String, String> {
     if url.starts_with("http://") || url.starts_with("https://") {
@@ -23,7 +29,7 @@ fn validate_url(url: &str) -> Result<String, String> {
     }
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 struct Crate {
     name: String,
     version: String,
@@ -126,6 +132,12 @@ enum Command {
         /// Directory of manifest files from previous transfers, browsable in the web UI
         #[arg(long, value_name = "DIR")]
         manifests: Option<PathBuf>,
+
+        /// When a manifest page loads and its data is older than this, scan the mirror and the
+        /// manifests again in the background. Takes `s`, `m`, or `h`, e.g. `30s` or `1h`.
+        /// `0` turns it off, so that only the Refresh button scans.
+        #[arg(long, value_name = "DURATION", default_value = "10m")]
+        rescan_after: serve::Rescan,
     },
 }
 
@@ -212,8 +224,9 @@ fn run() -> anyhow::Result<()> {
             mirror_path,
             bind,
             manifests,
+            rescan_after,
         } => {
-            serve::serve(mirror_path, bind, manifests)?;
+            serve::serve(mirror_path, bind, manifests, rescan_after)?;
         }
     }
 

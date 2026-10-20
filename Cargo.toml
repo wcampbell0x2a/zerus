@@ -15,6 +15,7 @@ keywords = ["offline", "mirror", "crates", "download", "vendor"]
 clap = { version = "4.5.13", features = ["derive"] }
 reqwest = { version = "0.12.8", default-features = false, features = ["blocking", "rustls-tls", "http2"] }
 anyhow = "1.0.90"
+tempfile = "3.13.0"
 guppy = "0.17.5"
 rayon = "1.10.0"
 git2 = { version = "0.20.0", features = ["vendored-libgit2", "vendored-openssl"] }
@@ -27,7 +28,7 @@ toml = "1.0"
 semver = "1"
 axum = "0.8"
 indicatif = "0.18"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower-http = { version = "0.6", features = ["trace"] }
@@ -35,11 +36,15 @@ tracing-indicatif = "0.3"
 maud = { version = "0.27.0", features = ["axum"] }
 time = { version = "0.3", features = ["formatting", "macros"] }
 
+# The musl allocator is slow when many threads allocate at once, as the rayon stat calls on
+# the manifest pages do: those pages were 9 times slower than on glibc.
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = "0.1"
 
 [dev-dependencies]
 assert_cmd = { version = "2.0.16", features = ["color", "color-auto"] }
-tempfile = "3.13.0"
 insta = "1.42.1"
+tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
 strip = true

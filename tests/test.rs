@@ -1,3 +1,6 @@
+use std::path::Path;
+use std::process::{Child, Stdio};
+use std::time::{Duration, Instant};
 use std::{fs::File, io::Write, process::Output};
 
 use assert_cmd::Command;
@@ -228,16 +231,18 @@ fn test_build_std(nightly_ver: &str, tmp_dir_path: std::path::PathBuf, port: u32
     let tmp_dir_cargo_path = tmp_dir_cargo.keep();
 
     // host the crates with a dummy python3 http server
-    let _server_handle = std::process::Command::new("python3")
-        .args([
-            "-m",
-            "http.server",
-            "-d",
-            tmp_dir_path.to_str().unwrap(),
-            &port.to_string(),
-        ])
-        .spawn()
-        .expect("python3 server command failed to start");
+    let _server_handle = KillOnDrop(
+        std::process::Command::new("python3")
+            .args([
+                "-m",
+                "http.server",
+                "-d",
+                tmp_dir_path.to_str().unwrap(),
+                &port.to_string(),
+            ])
+            .spawn()
+            .expect("python3 server command failed to start"),
+    );
 
     // create the cargo project
     std::process::Command::new("cargo")
@@ -294,6 +299,181 @@ build-std-features = ["panic_immediate_abort"]
         .output()
         .unwrap();
     assert_success(&output);
+}
+
+/// Serve a mirror with `zerus serve`, and use the search API and the downloads through it
+/// with cargo. A crate added by a later `update-index` must show in the search with no restart.
+#[test]
+fn test_serve_search_and_download() {
+    let zerus = assert_cmd::cargo::cargo_bin("zerus");
+    let tmp_dir = Builder::new().tempdir_in("./").unwrap();
+    let tmp = tmp_dir.path();
+    let staging = tmp.join("staging");
+    let mirror = tmp.join("mirror");
+
+    // Two crates with no depends, pinned so the test does not change when they release
+    let project = tmp.join("project");
+    write_project(
+        &project,
+        r#"itoa = "=1.0.11"
+ryu = "=1.0.18""#,
+    );
+    let output = Command::new(&zerus)
+        .args([
+            "mirror",
+            staging.to_str().unwrap(),
+            project.join("Cargo.toml").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_success(&output);
+
+    // Only `itoa` is in the mirror at first
+    move_crate(&staging, &mirror, "itoa", "1.0.11");
+    let port = free_port();
+    let url = format!("http://127.0.0.1:{port}");
+    update_index(&zerus, &mirror, &url);
+
+    let _server = KillOnDrop(
+        std::process::Command::new(&zerus)
+            .args([
+                "serve",
+                mirror.to_str().unwrap(),
+                "--bind",
+                &format!("127.0.0.1:{port}"),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("zerus serve failed to start"),
+    );
+    wait_for_port(port);
+
+    // A cargo home of its own, so the test does not use the cache of the user
+    let consumer = tmp.join("consumer");
+    write_project(&consumer, r#"itoa = "=1.0.11""#);
+    std::fs::create_dir_all(consumer.join(".cargo")).unwrap();
+    std::fs::write(
+        consumer.join(".cargo/config.toml"),
+        format!(
+            r#"
+[registries.zerus]
+index = "sparse+{url}/crates.io-index/"
+
+[source.zerus]
+registry = "sparse+{url}/crates.io-index/"
+
+[source.crates-io]
+replace-with = "zerus"
+"#
+        ),
+    )
+    .unwrap();
+    let cargo_home = tmp.join("cargo-home");
+    let cargo = |args: &[&str]| {
+        let output = std::process::Command::new("cargo")
+            .args(args)
+            .current_dir(&consumer)
+            .env("CARGO_HOME", &cargo_home)
+            .output()
+            .unwrap();
+        assert_success(&output);
+        String::from_utf8(output.stdout).unwrap()
+    };
+
+    let found = cargo(&["search", "--registry", "zerus", "itoa"]);
+    assert!(found.contains(r#"itoa = "1.0.11""#), "{found}");
+    let found = cargo(&["search", "--registry", "zerus", "ryu"]);
+    assert!(!found.contains("ryu"), "{found}");
+
+    // Add `ryu` the way a user would, and do not restart the server
+    move_crate(&staging, &mirror, "ryu", "1.0.18");
+    update_index(&zerus, &mirror, &url);
+    let found = cargo(&["search", "--registry", "zerus", "ryu"]);
+    assert!(found.contains(r#"ryu = "1.0.18""#), "{found}");
+
+    // Download through the server
+    cargo(&["fetch"]);
+    assert!(
+        walk(&cargo_home.join("registry/cache")).any(|file| file.ends_with("itoa-1.0.11.crate")),
+        "itoa was not downloaded"
+    );
+}
+
+/// Write a library crate with these `[dependencies]` lines
+fn write_project(dir: &Path, dependencies: &str) {
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "").unwrap();
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{dependencies}\n",
+            dir.file_name().unwrap().to_str().unwrap()
+        ),
+    )
+    .unwrap();
+}
+
+/// Move the `.crate` file of a crate from one mirror to the other
+fn move_crate(from: &Path, to: &Path, name: &str, version: &str) {
+    let file = walk(&from.join("crates"))
+        .find(|file| file.ends_with(format!("{name}-{version}.crate")))
+        .unwrap_or_else(|| panic!("{name}@{version} is not in {}", from.display()));
+    let relative = file.strip_prefix(from).unwrap();
+    std::fs::create_dir_all(to.join(relative).parent().unwrap()).unwrap();
+    std::fs::rename(&file, to.join(relative)).unwrap();
+}
+
+/// Every file under `dir`
+fn walk(dir: &Path) -> impl Iterator<Item = std::path::PathBuf> {
+    let mut files = Vec::new();
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    files.into_iter()
+}
+
+fn update_index(zerus: &Path, mirror: &Path, url: &str) {
+    let output = Command::new(zerus)
+        .args(["update-index", mirror.to_str().unwrap(), "--dl-url", url])
+        .output()
+        .unwrap();
+    assert_success(&output);
+}
+
+/// A port that no other process uses now
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+fn wait_for_port(port: u16) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < deadline, "the server did not start");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Stops a server when the test ends, also when the test fails, so no server stays running
+struct KillOnDrop(Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 fn assert_success(output: &Output) {

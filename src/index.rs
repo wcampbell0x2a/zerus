@@ -115,14 +115,24 @@ pub fn find_crate_files(crates_path: &Path) -> Vec<PathBuf> {
 // Recurse into subdirs in parallel via rayon. `on_found` fires per .crate hit;
 // pass `&|| {}` to skip it.
 fn find_crate_files_recursive(dir: &Path, on_found: &(impl Fn() + Sync)) -> Vec<PathBuf> {
-    let entries: Vec<PathBuf> = match fs::read_dir(dir) {
-        Ok(e) => e.flatten().map(|entry| entry.path()).collect(),
+    let entries: Vec<(PathBuf, Option<fs::FileType>)> = match fs::read_dir(dir) {
+        Ok(e) => e
+            .flatten()
+            .map(|entry| (entry.path(), entry.file_type().ok()))
+            .collect(),
         Err(_) => return Vec::new(),
     };
     entries
         .par_iter()
-        .flat_map(|path| {
-            if path.is_dir() {
+        .flat_map(|(path, file_type)| {
+            // The directory listing gives the type, so most entries need no stat. That is a
+            // network round trip saved per entry on a network mount. A symlink still needs a
+            // stat to find out what it points to.
+            let is_dir = match file_type {
+                Some(t) if !t.is_symlink() => t.is_dir(),
+                _ => path.is_dir(),
+            };
+            if is_dir {
                 find_crate_files_recursive(path, on_found)
             } else if path.extension().is_some_and(|e| e == "crate") {
                 on_found();
@@ -308,12 +318,18 @@ pub fn write_index_entries(index_path: &Path, new_entries: &[IndexEntry]) -> any
     } else {
         lines.join("\n") + "\n"
     };
-    fs::write(&index_file, content)
+    crate::atomic::write(&index_file, content)
         .with_context(|| format!("failed to write {}", index_file.display()))?;
 
     Ok(())
 }
 
+/// Generate a Cargo registry index from `.crate` files.
+///
+/// If `dl_url` is provided, writes a `config.json` with the sparse
+/// download URL. The URL is a base path — zerus appends
+/// `/crates/{prefix}/{crate}/{version}/{crate}-{version}.crate` to it.
+/// Pass the server address, not the full download template.
 pub fn update_index(
     index_path: &Path,
     crates_path: &Path,
@@ -368,20 +384,62 @@ pub fn update_index(
 
     if let Some(url) = dl_url {
         let config_path = index_path.join("config.json");
-        let file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&config_path)
-            .with_context(|| format!("failed to create {}", config_path.display()))?;
-        crate::git::write_config_json(url, file).context("failed to write config.json")?;
+        let mut config = Vec::new();
+        crate::git::write_config_json(url, &mut config).context("failed to write config.json")?;
+        crate::atomic::write(&config_path, config)
+            .with_context(|| format!("failed to write {}", config_path.display()))?;
     } else if !index_path.join("config.json").exists() {
         warn!(
             "no config.json found in index and --dl-url not provided; the index will be unusable without it"
         );
     }
 
+    write_updated_marker(index_path)?;
     info!("index updated at {}", index_path.display());
 
     Ok(())
+}
+
+/// The file that `update_index` writes last. The server reads it to know that the index
+/// changed, as the index has no other file that each update writes. A dotfile, so that
+/// nothing takes it for the index file of a crate.
+pub const UPDATED_MARKER: &str = ".zerus-updated";
+
+/// Write a new value to the marker. The value is the time in nanoseconds, so that two updates
+/// in the same second still give two values: some disks keep write times only to the second.
+pub fn write_updated_marker(index_path: &Path) -> anyhow::Result<()> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = index_path.join(UPDATED_MARKER);
+    crate::atomic::write(&path, format!("{nanos}\n"))
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_index_writes_a_new_marker_each_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = tmp.path().join("crates.io-index");
+        let crates = tmp.path().join("crates");
+        fs::create_dir(&crates).unwrap();
+        let marker = || fs::read_to_string(index.join(UPDATED_MARKER)).unwrap();
+
+        update_index(&index, &crates, None).unwrap();
+        let first = marker();
+        update_index(&index, &crates, None).unwrap();
+
+        assert!(!first.trim().is_empty());
+        assert_ne!(marker(), first);
+    }
+
+    #[test]
+    fn write_updated_marker_fails_on_a_missing_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(write_updated_marker(&tmp.path().join("nope")).is_err());
+    }
 }

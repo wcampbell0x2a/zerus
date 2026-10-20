@@ -235,6 +235,11 @@ fn fast_forward(
     Ok(())
 }
 
+/// Write a Cargo registry `config.json` for a sparse index.
+///
+/// The `url` is a base path — this function appends
+/// `/crates/{prefix}/{crate}/{version}/{crate}-{version}.crate` to it.
+/// Pass the server address, not the full download template.
 pub fn write_config_json(url: &str, mut writer: impl Write) -> std::io::Result<()> {
     let f = format!(
         r#"{{

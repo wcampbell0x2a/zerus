@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -124,7 +123,9 @@ fn download_and_save(
 
                 fs::create_dir_all(&dir_crate_path)
                     .with_context(|| format!("failed to create directory {}", dir_crate_path.display()))?;
-                fs::write(&crate_path, bytes)
+                // A server can serve this mirror while it downloads, so a client must not
+                // get a half-written crate
+                crate::atomic::write(&crate_path, bytes)
                     .with_context(|| format!("failed to write {}", crate_path.display()))?;
             }
             span.pb_inc(1);
@@ -414,7 +415,7 @@ fn expand_deps(mirror_path: &Path) -> anyhow::Result<()> {
                 span.pb_inc(1);
                 return;
             }
-            if let Err(e) = fs::write(&crate_path, bytes) {
+            if let Err(e) = crate::atomic::write(&crate_path, bytes) {
                 warn!("failed to write {}: {e}", crate_path.display());
                 span.pb_inc(1);
                 return;
@@ -506,12 +507,10 @@ pub fn mirror(
 
     if let Some(url) = git_index_url {
         let path = mirror_path.join("crates.io-index").join("config.json");
-        let file = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&path)
-            .with_context(|| format!("failed to open {}", path.display()))?;
-        write_config_json(&url, file).context("failed to write config.json")?;
+        let mut config = Vec::new();
+        write_config_json(&url, &mut config).context("failed to write config.json")?;
+        crate::atomic::write(&path, config)
+            .with_context(|| format!("failed to write {}", path.display()))?;
     }
 
     Ok(())

@@ -65,6 +65,8 @@ On the offline network, use `update-index` to generate a registry index from the
 $ zerus update-index new-mirror --dl-url http://[IP]
 ```
 
+The URL is a base path — zerus appends `/crates/{prefix}/{crate}/{version}/{crate}-{version}.crate` to it. Pass the server address, not the full download template.
+
 ### Serve mirror
 Use `zerus serve` to host the registry with sparse index, crate downloads, and a search API.
 ```console
@@ -97,6 +99,22 @@ browse them in the web UI at the root path.
 $ zerus serve new-mirror --manifests manifests/
 ```
 
+The server scans the mirror and the manifests in the background when it starts, and keeps
+the result in memory, so the pages stay fast when the mirror is on a slow or network disk.
+Cargo can use the registry while the first scan runs. The header of each page shows how old
+its data is. When a page loads and its data is older than 10 minutes, the server scans again in
+the background, and the page shows the old data until the scan is done. A server that nobody
+looks at does no scans. To scan at once, click Refresh in the header. The page reloads when the
+scan is done. Only one scan runs at a time.
+
+Set the age with `--rescan-after`, e.g. `30s` or `1h`. Use `0` so that only Refresh scans:
+```console
+$ zerus serve new-mirror --manifests manifests/ --rescan-after 1h
+```
+
+To try the web UI, `just demo` makes a demo mirror with five transfers in `target/demo` and
+serves it at `http://127.0.0.1:3000`. Pass another port with `just demo 8000`.
+
 ### Build with mirror
 Add the following to `.cargo/config.toml` (replacing `[IP]` with your server address).
 ```toml
@@ -114,3 +132,8 @@ With the `registries` entry, you can search the mirror:
 ```console
 $ cargo search --registry zerus serde
 ```
+
+The server reads the index for the search when it starts, and keeps it in memory. Each run of
+`update-index` writes a marker file, `crates.io-index/.zerus-updated`, so the next search reads
+the index again and finds the new crates. For an index with no marker, e.g. from an older zerus,
+the search reads the index again when it is older than `--rescan-after`.
