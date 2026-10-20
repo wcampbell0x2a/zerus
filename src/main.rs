@@ -131,6 +131,12 @@ enum Command {
         /// Directory of manifest files from previous transfers, browsable in the web UI
         #[arg(long, value_name = "DIR")]
         manifests: Option<PathBuf>,
+
+        /// When a manifest page loads and its data is older than this, scan the mirror and the
+        /// manifests again in the background. Takes `s`, `m`, or `h`, e.g. `30s` or `1h`.
+        /// `0` turns it off, so that only the Refresh button scans.
+        #[arg(long, value_name = "DURATION", default_value = "10m")]
+        rescan_after: serve::Rescan,
     },
 }
 
@@ -217,8 +223,9 @@ fn run() -> anyhow::Result<()> {
             mirror_path,
             bind,
             manifests,
+            rescan_after,
         } => {
-            serve::serve(mirror_path, bind, manifests)?;
+            serve::serve(mirror_path, bind, manifests, rescan_after)?;
         }
     }
 

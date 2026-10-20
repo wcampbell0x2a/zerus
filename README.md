@@ -102,8 +102,15 @@ $ zerus serve new-mirror --manifests manifests/
 The server scans the mirror and the manifests in the background when it starts, and keeps
 the result in memory, so the pages stay fast when the mirror is on a slow or network disk.
 Cargo can use the registry while the first scan runs. The header of each page shows how old
-its data is. To see new transfers and culls, click Refresh in the header. The scan runs in the
-background, and the page reloads until the scan is done. Only one scan runs at a time.
+its data is. When a page loads and its data is older than 10 minutes, the server scans again in
+the background, and the page shows the old data until the scan is done. A server that nobody
+looks at does no scans. To scan at once, click Refresh in the header. The page reloads when the
+scan is done. Only one scan runs at a time.
+
+Set the age with `--rescan-after`, e.g. `30s` or `1h`. Use `0` so that only Refresh scans:
+```console
+$ zerus serve new-mirror --manifests manifests/ --rescan-after 1h
+```
 
 ### Build with mirror
 Add the following to `.cargo/config.toml` (replacing `[IP]` with your server address).

@@ -30,15 +30,57 @@ struct AppState {
 }
 
 impl AppState {
-    fn new(mirror_path: PathBuf, manifests_path: Option<PathBuf>) -> anyhow::Result<Self> {
+    fn new(
+        mirror_path: PathBuf,
+        manifests_path: Option<PathBuf>,
+        rescan: Rescan,
+    ) -> anyhow::Result<Self> {
         let browse = manifests_path
-            .map(|manifests_path| Browse::new(mirror_path.clone(), manifests_path))
+            .map(|manifests_path| Browse::new(mirror_path.clone(), manifests_path, rescan))
             .transpose()?
             .map(Arc::new);
         Ok(Self {
             mirror_path,
             browse,
         })
+    }
+}
+
+/// When a page load starts a scan on its own
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rescan {
+    /// Only the Refresh button starts a scan
+    Never,
+    /// A page load starts a background scan when its data is older than this. The scan runs
+    /// only when someone looks, so an idle server does no work on the disk.
+    After(Duration),
+}
+
+impl FromStr for Rescan {
+    type Err = String;
+
+    /// Parse `0`, or a whole number with the unit `s`, `m`, or `h`, e.g. `10m`
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let bad = || format!("expected 0, or a duration such as 30s, 10m, or 1h, found {value:?}");
+        if value == "0" {
+            return Ok(Self::Never);
+        }
+        let unit_at = value
+            .find(|c: char| !c.is_ascii_digit())
+            .filter(|&at| at > 0)
+            .ok_or_else(bad)?;
+        let (number, unit) = value.split_at(unit_at);
+        let number: u64 = number.parse().map_err(|_| bad())?;
+        let unit_secs = match unit {
+            "s" => 1,
+            "m" => 60,
+            "h" => 3600,
+            _ => return Err(bad()),
+        };
+        match number.checked_mul(unit_secs).ok_or_else(bad)? {
+            0 => Ok(Self::Never),
+            secs => Ok(Self::After(Duration::from_secs(secs))),
+        }
     }
 }
 
@@ -52,12 +94,14 @@ struct Browse {
     /// Directory of manifest files from previous transfers
     manifests_path: PathBuf,
     /// The result of the last scan, or `None` until the first scan is done. On a network mount,
-    /// reading the mirror takes one round trip per crate, so a scan runs only at startup and
-    /// when the user clicks Refresh. Every manifest page uses the copy that is here.
+    /// reading the mirror takes one round trip per crate, so a scan runs only at startup, when
+    /// the user clicks Refresh, and when a page load finds the data stale. Every manifest page
+    /// uses the copy that is here.
     snapshot: RwLock<Option<Arc<Snapshot>>>,
     /// When the running scan started, or `None` if no scan runs. Only one scan runs at a time,
     /// so many refreshes at the same time do not each scan the whole mirror.
     running: Mutex<Option<SystemTime>>,
+    rescan: Rescan,
     /// The scans run on this pool and not on the global one. Each page sorts its rows on the
     /// global pool, and a scan there would make every page wait for the scan to finish.
     scan_pool: rayon::ThreadPool,
@@ -82,7 +126,7 @@ struct Scans {
 }
 
 impl Browse {
-    fn new(mirror_path: PathBuf, manifests_path: PathBuf) -> anyhow::Result<Self> {
+    fn new(mirror_path: PathBuf, manifests_path: PathBuf, rescan: Rescan) -> anyhow::Result<Self> {
         let scan_pool = rayon::ThreadPoolBuilder::new()
             .num_threads(SCAN_THREADS)
             .thread_name(|n| format!("scan-{n}"))
@@ -94,6 +138,7 @@ impl Browse {
             manifests_path,
             snapshot: RwLock::new(None),
             running: Mutex::new(None),
+            rescan,
             scan_pool,
         })
     }
@@ -113,6 +158,19 @@ impl Browse {
             .as_ref()
             .map(Arc::clone);
         Scans { shown, running }
+    }
+
+    /// Is the data in `scans` so old at `now` that a page load must start a scan?
+    /// No data at all, e.g. after a failed start, is old too.
+    fn is_stale(&self, scans: &Scans, now: SystemTime) -> bool {
+        let Rescan::After(limit) = self.rescan else {
+            return false;
+        };
+        let fresh = scans
+            .shown
+            .as_ref()
+            .is_some_and(|shown| now.duration_since(shown.started).unwrap_or_default() < limit);
+        scans.running.is_none() && !fresh
     }
 
     /// Start a scan of the mirror and the manifests on a new thread, unless one already runs.
@@ -532,7 +590,7 @@ fn format_time_with_seconds(time: SystemTime) -> String {
 fn ago(then: SystemTime, now: SystemTime) -> String {
     let secs = now.duration_since(then).unwrap_or_default().as_secs();
     match secs {
-        0..=59 => "just now".to_string(),
+        0..=59 => format!("{secs} s ago"),
         60..=3599 => format!("{} min ago", secs / 60),
         3600..=86_399 => format!("{} h ago", secs / 3600),
         _ => format!("{} d ago", secs / 86_400),
@@ -557,12 +615,26 @@ fn grouped(n: usize) -> String {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Reload {
     Never,
-    /// A scan runs, so reload until the page shows its result
-    WhileScanning,
+    /// A scan runs, so reload once, when the scan is done
+    WhenScanDone,
 }
 
-/// Seconds between reloads while a scan runs
-const RELOAD_SECS: u32 = 3;
+/// Without JavaScript, the page cannot ask when the scan is done, so it reloads this often.
+/// The reload goes back to the top of the page, so it is not short.
+const NOSCRIPT_RELOAD_SECS: u32 = 15;
+
+// Ask the server each 2 s if the scan still runs, and reload once when it is done. A reload
+// on a timer would jump back to the top of a long page while the user reads it.
+const SCAN_WAIT_JS: &str = "\
+(function poll() {
+  setTimeout(function () {
+    fetch('/scan-status')
+      .then(function (r) { return r.json(); })
+      .then(function (s) { if (s.running) { poll(); } else { location.reload(); } })
+      .catch(poll);
+  }, 2000);
+})();
+";
 
 /// The part of the page header that tells how old the data is
 #[derive(Clone)]
@@ -587,13 +659,16 @@ fn status_bar(scans: &Scans, back: &str, now: SystemTime) -> StatusBar {
                 " · "
             }
             @match scans.running {
-                Some(started) => span { "scan running since " (format_time_with_seconds(started)) "…" },
+                Some(started) => span {
+                    "scan running since " (format_time_with_seconds(started))
+                    "… the page reloads when it is done"
+                },
                 None => (refresh_button(back)),
             }
         }
     };
     let reload = match scans.running {
-        Some(_) => Reload::WhileScanning,
+        Some(_) => Reload::WhenScanDone,
         None => Reload::Never,
     };
     StatusBar { markup, reload }
@@ -949,8 +1024,8 @@ fn page_with_search(
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
-                @if reload == Reload::WhileScanning {
-                    meta http-equiv="refresh" content=(RELOAD_SECS);
+                @if reload == Reload::WhenScanDone {
+                    noscript { meta http-equiv="refresh" content=(NOSCRIPT_RELOAD_SECS); }
                 }
                 title { (title) }
                 style { (PAGE_CSS) }
@@ -970,6 +1045,9 @@ fn page_with_search(
                 }
                 main { (body) }
                 script { (PreEscaped(SEARCH_SHORTCUT_JS)) }
+                @if reload == Reload::WhenScanDone {
+                    script { (PreEscaped(SCAN_WAIT_JS)) }
+                }
             }
         }
     }
@@ -1079,10 +1157,21 @@ fn no_manifests_page() -> ErrorPage {
 }
 
 /// The scans and the status bar for a manifest page at `back`, or the page to show instead
+/// When the data is stale, this starts a scan, and the page shows the old data until the
+/// scan is done.
 fn page_scans(state: &AppState, back: &str) -> Result<(Scans, StatusBar), ErrorPage> {
-    let browse = state.browse.as_deref().ok_or_else(no_manifests_page)?;
-    let scans = browse.scans();
-    let bar = status_bar(&scans, back, SystemTime::now());
+    let browse = state.browse.as_ref().ok_or_else(no_manifests_page)?;
+    let now = SystemTime::now();
+    let mut scans = browse.scans();
+    if browse.is_stale(&scans, now) {
+        match browse.start_scan() {
+            Ok(ScanStart::Started(_)) => info!("the data is stale, so a page load started a scan"),
+            Ok(ScanStart::AlreadyRunning) => {}
+            Err(e) => warn!("failed to start a scan: {e}"),
+        }
+        scans = browse.scans();
+    }
+    let bar = status_bar(&scans, back, now);
     Ok((scans, bar))
 }
 
@@ -1220,6 +1309,20 @@ fn manifests_index_page(state: &AppState) -> Result<Markup, ErrorPage> {
             (unparsed_warning(snapshot.unparsed()))
         },
     ))
+}
+
+#[derive(Serialize)]
+struct ScanStatus {
+    running: bool,
+}
+
+/// Tells a page that waits for a scan if the scan still runs
+async fn scan_status(State(state): State<Arc<AppState>>) -> Json<ScanStatus> {
+    let running = state
+        .browse
+        .as_ref()
+        .is_some_and(|browse| browse.running().is_some());
+    Json(ScanStatus { running })
 }
 
 #[derive(serde::Deserialize)]
@@ -1488,6 +1591,7 @@ fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(manifests_index))
         .route("/refresh", post(refresh))
+        .route("/scan-status", get(scan_status))
         .route("/manifests/{name}", get(manifest_detail))
         .route("/unmanifested", get(unmanifested))
         .route("/search", get(manifest_search))
@@ -1502,8 +1606,9 @@ pub fn serve(
     mirror_path: PathBuf,
     bind: String,
     manifests_path: Option<PathBuf>,
+    rescan: Rescan,
 ) -> anyhow::Result<()> {
-    let state = Arc::new(AppState::new(mirror_path, manifests_path)?);
+    let state = Arc::new(AppState::new(mirror_path, manifests_path, rescan)?);
 
     // The first scan runs in the background, so that cargo can use the registry at once
     if let Some(browse) = &state.browse {
@@ -1679,7 +1784,7 @@ mod tests {
         // A broken manifest elsewhere must not break the page of `a.txt`
         fs::write(manifests.join("broken.txt"), "nope\n").unwrap();
 
-        let state = AppState::new(mirror, Some(manifests)).unwrap();
+        let state = AppState::new(mirror, Some(manifests), Rescan::Never).unwrap();
         rescan(&state);
         (tmp, state)
     }
@@ -1918,7 +2023,7 @@ serde@1.0.210
         assert_eq!(detail(&state, "nope.txt", ""), Err(StatusCode::NOT_FOUND));
         assert_eq!(detail(&state, "../mirror", ""), Err(StatusCode::NOT_FOUND));
 
-        let no_dir = AppState::new(state.mirror_path.clone(), None).unwrap();
+        let no_dir = AppState::new(state.mirror_path.clone(), None, Rescan::Never).unwrap();
         let (status, html) = error_body(manifest_detail_page(&no_dir, "a.txt", params("")));
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(html.contains("No manifests directory"), "{html}");
@@ -1926,6 +2031,7 @@ serde@1.0.210
         let gone_dir = AppState::new(
             state.mirror_path.clone(),
             Some(state.mirror_path.join("nope")),
+            Rescan::Never,
         )
         .unwrap();
         rescan(&gone_dir);
@@ -1997,6 +2103,7 @@ serde@1.0.210
         let state = AppState::new(
             tmp.path().join("mirror"),
             Some(tmp.path().join("manifests")),
+            Rescan::Never,
         )
         .unwrap();
         *browse(&state).running() = Some(SystemTime::now());
@@ -2006,9 +2113,10 @@ serde@1.0.210
         assert!(html.contains("still running"), "{html}");
         assert!(html.contains("scan running since"), "{html}");
         assert!(
-            html.contains(r#"<meta http-equiv="refresh" content="3">"#),
+            html.contains(r#"<noscript><meta http-equiv="refresh" content="15"></noscript>"#),
             "{html}"
         );
+        assert!(html.contains("fetch('/scan-status')"), "{html}");
         assert!(!html.contains(r#"action="/refresh""#), "{html}");
         for page in [
             detail(&state, "a.txt", ""),
@@ -2022,6 +2130,7 @@ serde@1.0.210
         rescan(&state);
         let list = index(&state).unwrap();
         assert!(!list.contains("http-equiv"), "{list}");
+        assert!(!list.contains("/scan-status"), "{list}");
     }
 
     #[test]
@@ -2030,6 +2139,7 @@ serde@1.0.210
         let state = AppState::new(
             tmp.path().join("mirror"),
             Some(tmp.path().join("manifests")),
+            Rescan::Never,
         )
         .unwrap();
 
@@ -2044,7 +2154,7 @@ serde@1.0.210
     #[test]
     fn no_manifests_dir_needs_no_scan() {
         let (tmp, _) = fixture();
-        let state = AppState::new(tmp.path().join("mirror"), None).unwrap();
+        let state = AppState::new(tmp.path().join("mirror"), None, Rescan::Never).unwrap();
 
         assert!(state.browse.is_none());
         let (status, html) = error_body(manifests_index_page(&state));
@@ -2152,7 +2262,8 @@ serde@1.0.210
     #[tokio::test]
     async fn refresh_without_a_manifests_dir_goes_back() {
         let (tmp, _) = fixture();
-        let state = Arc::new(AppState::new(tmp.path().join("mirror"), None).unwrap());
+        let state =
+            Arc::new(AppState::new(tmp.path().join("mirror"), None, Rescan::Never).unwrap());
 
         let response = refresh(State(state), Form(RefreshForm { back: None }))
             .await
@@ -2162,11 +2273,137 @@ serde@1.0.210
     }
 
     #[test]
+    fn rescan_parses_durations_and_zero() {
+        for (text, rescan) in [
+            ("0", Rescan::Never),
+            ("0m", Rescan::Never),
+            ("30s", Rescan::After(Duration::from_secs(30))),
+            ("10m", Rescan::After(Duration::from_secs(600))),
+            ("2h", Rescan::After(Duration::from_secs(7200))),
+        ] {
+            assert_eq!(text.parse::<Rescan>(), Ok(rescan), "{text}");
+        }
+    }
+
+    #[test]
+    fn rescan_rejects_other_text() {
+        for text in [
+            "",
+            "10",
+            "m",
+            "-1m",
+            "1.5m",
+            "10 m",
+            "10min",
+            "1d",
+            "é",
+            "1é",
+            "99999999999999999999h",
+            "18446744073709551615h",
+        ] {
+            let err = text.parse::<Rescan>().unwrap_err();
+            assert!(err.contains("such as 30s, 10m, or 1h"), "{text}: {err}");
+        }
+    }
+
+    #[test]
+    fn data_is_stale_only_after_the_limit_and_with_no_scan_running() {
+        let (tmp, _) = fixture();
+        let browse = Browse::new(
+            tmp.path().join("mirror"),
+            tmp.path().join("manifests"),
+            Rescan::After(Duration::from_secs(600)),
+        )
+        .unwrap();
+        let shown = fixture().1.browse.unwrap().scans().shown;
+        let started = shown.as_ref().unwrap().started;
+        let at = |secs| started + Duration::from_secs(secs);
+        let scans = |running| Scans {
+            shown: shown.clone(),
+            running,
+        };
+
+        assert!(!browse.is_stale(&scans(None), at(599)));
+        assert!(browse.is_stale(&scans(None), at(600)));
+        assert!(!browse.is_stale(&scans(Some(at(0))), at(6000)));
+        // No data at all, and no scan to bring it
+        let empty = Scans {
+            shown: None,
+            running: None,
+        };
+        assert!(browse.is_stale(&empty, at(0)));
+
+        let never = Browse::new(
+            tmp.path().join("mirror"),
+            tmp.path().join("manifests"),
+            Rescan::Never,
+        )
+        .unwrap();
+        assert!(!never.is_stale(&scans(None), at(1_000_000)));
+        assert!(!never.is_stale(&empty, at(0)));
+    }
+
+    #[test]
+    fn a_page_load_with_stale_data_starts_a_scan_and_shows_the_old_data() {
+        let (tmp, _) = clean_fixture();
+        let state = AppState::new(
+            tmp.path().join("mirror"),
+            Some(tmp.path().join("manifests")),
+            Rescan::After(Duration::from_secs(1)),
+        )
+        .unwrap();
+        let old = rescan(&state);
+        fs::write(manifests_dir(&state).join("b.txt"), "serde@1.0.210\n").unwrap();
+        std::thread::sleep(Duration::from_millis(1100));
+
+        let list = index(&state).unwrap();
+
+        // The page did not wait for the scan
+        assert!(!list.contains("b.txt"), "{list}");
+        wait_for_scan(browse(&state));
+        let new = browse(&state).scans().shown.unwrap();
+        assert!(!Arc::ptr_eq(&old, &new));
+        assert!(index(&state).unwrap().contains("b.txt"));
+    }
+
+    #[test]
+    fn a_page_load_with_fresh_data_starts_no_scan() {
+        let (tmp, _) = clean_fixture();
+        let state = AppState::new(
+            tmp.path().join("mirror"),
+            Some(tmp.path().join("manifests")),
+            Rescan::After(Duration::from_secs(3600)),
+        )
+        .unwrap();
+        let old = rescan(&state);
+
+        index(&state).unwrap();
+
+        assert!(browse(&state).scans().running.is_none());
+        assert!(Arc::ptr_eq(&old, &browse(&state).scans().shown.unwrap()));
+    }
+
+    #[tokio::test]
+    async fn scan_status_tells_if_a_scan_runs() {
+        let (_tmp, state) = fixture();
+        let state = Arc::new(state);
+
+        assert!(!scan_status(State(Arc::clone(&state))).await.0.running);
+        *browse(&state).running() = Some(SystemTime::now());
+        assert!(scan_status(State(Arc::clone(&state))).await.0.running);
+
+        let (tmp, _) = fixture();
+        let no_dir =
+            Arc::new(AppState::new(tmp.path().join("mirror"), None, Rescan::Never).unwrap());
+        assert!(!scan_status(State(no_dir)).await.0.running);
+    }
+
+    #[test]
     fn ago_uses_the_largest_unit_that_fits() {
         let then = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         for (secs, text) in [
-            (0, "just now"),
-            (59, "just now"),
+            (0, "0 s ago"),
+            (59, "59 s ago"),
             (60, "1 min ago"),
             (3599, "59 min ago"),
             (3600, "1 h ago"),
@@ -2177,7 +2414,7 @@ serde@1.0.210
             assert_eq!(ago(then, then + Duration::from_secs(secs)), text, "{secs}");
         }
         // A clock that went back gives no negative age
-        assert_eq!(ago(then, then - Duration::from_secs(5)), "just now");
+        assert_eq!(ago(then, then - Duration::from_secs(5)), "0 s ago");
     }
 
     #[test]
@@ -2209,7 +2446,7 @@ serde@1.0.210
             now,
         );
         let html = busy.markup.into_string();
-        assert_eq!(busy.reload, Reload::WhileScanning);
+        assert_eq!(busy.reload, Reload::WhenScanDone);
         assert!(html.contains("data from 3 min ago"), "{html}");
         assert!(html.contains("scan running since"), "{html}");
         assert!(!html.contains("Refresh"), "{html}");
@@ -2256,7 +2493,7 @@ serde@1.0.210
 
         let list = index(&state).unwrap();
         assert!(list.contains(r#"<div class="status">"#), "{list}");
-        assert!(list.contains("data from just now"), "{list}");
+        assert!(list.contains("data from 0 s ago"), "{list}");
         assert!(list.contains(" UTC and took "), "{list}");
         assert!(list.contains(r#"<form class="refresh" action="/refresh" method="post">"#));
         assert!(list.contains(r#"name="back" value="/""#), "{list}");
@@ -2400,8 +2637,12 @@ serde@1.0.210
     #[test]
     fn a_failed_mirror_scan_does_not_show_crates_as_culled() {
         let (tmp, state) = clean_fixture();
-        let no_mirror =
-            AppState::new(tmp.path().join("nope"), Some(manifests_dir(&state))).unwrap();
+        let no_mirror = AppState::new(
+            tmp.path().join("nope"),
+            Some(manifests_dir(&state)),
+            Rescan::Never,
+        )
+        .unwrap();
         rescan(&no_mirror);
 
         let (status, html) = error_body(unmanifested_page(&no_mirror, params("")));
