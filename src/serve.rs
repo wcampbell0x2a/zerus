@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -540,26 +540,35 @@ async fn search(
     })
 }
 
+/// `path` under `root`, or `None` if `path` can get out of `root`. Only plain names are
+/// allowed: a `..`, a root, or a prefix in a request could read any file on the server.
+fn path_under(root: &Path, path: &str) -> Option<PathBuf> {
+    let relative = Path::new(path);
+    let mut components = relative.components().peekable();
+    let plain = components.peek().is_some()
+        && components.all(|component| matches!(component, Component::Normal(_)));
+    plain.then(|| root.join(relative))
+}
+
+/// The file at `path` under `root`. A path that can get out of `root` gets the same 404 as
+/// a missing file, so a request cannot find out which files exist outside the mirror.
+fn read_under(root: &Path, path: &str) -> Result<Vec<u8>, StatusCode> {
+    let file = path_under(root, path).ok_or(StatusCode::NOT_FOUND)?;
+    std::fs::read(file).map_err(|_| StatusCode::NOT_FOUND)
+}
+
 async fn serve_crate_file(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(path): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    let file_path = state.mirror_path.join("crates").join(&path);
-    match std::fs::read(&file_path) {
-        Ok(bytes) => Ok(bytes),
-        Err(_) => Err(StatusCode::NOT_FOUND),
-    }
+    read_under(&state.mirror_path.join("crates"), &path)
 }
 
 async fn serve_index_file(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(path): axum::extract::Path<String>,
 ) -> impl IntoResponse {
-    let file_path = state.mirror_path.join("crates.io-index").join(&path);
-    match std::fs::read(&file_path) {
-        Ok(bytes) => Ok(bytes),
-        Err(_) => Err(StatusCode::NOT_FOUND),
-    }
+    read_under(&state.mirror_path.join("crates.io-index"), &path)
 }
 
 /// Modification time of the `.crate` file, or `None` if it is not in the mirror.
@@ -2049,6 +2058,119 @@ mod tests {
             html.contains(r#"<a href="/manifests/a.txt?crate=axum%400.8.1#axum@0.8.1">a.txt</a>"#),
             "{html}"
         );
+    }
+
+    #[test]
+    fn path_under_keeps_plain_paths() {
+        let root = Path::new("/m");
+        for (path, joined) in [
+            (
+                "se/rd/serde/1.0.0/serde-1.0.0.crate",
+                "/m/se/rd/serde/1.0.0/serde-1.0.0.crate",
+            ),
+            ("1/a", "/m/1/a"),
+            ("config.json", "/m/config.json"),
+            // A `.` in the middle adds nothing, so it is safe
+            ("a/./b", "/m/a/b"),
+            ("a..b/..c", "/m/a..b/..c"),
+        ] {
+            assert_eq!(
+                path_under(root, path),
+                Some(PathBuf::from(joined)),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_under_refuses_paths_that_can_get_out() {
+        let root = Path::new("/m");
+        for path in [
+            "",
+            ".",
+            "./a",
+            "..",
+            "../etc/passwd",
+            "a/../../etc/passwd",
+            "a/b/..",
+            "/etc/passwd",
+            "//etc/passwd",
+        ] {
+            assert_eq!(path_under(root, path), None, "{path:?}");
+        }
+    }
+
+    /// Model check: whatever the input, a path that `path_under` keeps stays under the root
+    #[test]
+    fn path_under_never_gives_a_path_outside_the_root() {
+        let parts = ["a", "..", ".", "", "/", "b.crate", "..a", "%2e%2e"];
+        let root = Path::new("/m");
+        for x in parts {
+            for y in parts {
+                for z in parts {
+                    let path = format!("{x}/{y}/{z}");
+                    if let Some(joined) = path_under(root, &path) {
+                        let mut depth = 0i32;
+                        for component in joined.strip_prefix(root).unwrap().components() {
+                            depth += match component {
+                                Component::ParentDir => -1,
+                                Component::Normal(_) => 1,
+                                _ => 0,
+                            };
+                            assert!(depth >= 0, "{path} -> {}", joined.display());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Send `uri` through the whole router, as a client would
+    async fn get(state: AppState, uri: &str) -> (StatusCode, Vec<u8>) {
+        use tower::ServiceExt;
+        let request = axum::http::Request::get(uri)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = router(Arc::new(state)).oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, body.to_vec())
+    }
+
+    #[tokio::test]
+    async fn file_routes_serve_mirror_files_but_no_file_outside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mirror = tmp.path().join("mirror");
+        add_crate(&mirror, "serde", "1.0.210");
+        fs::create_dir_all(mirror.join("crates.io-index/se/rd")).unwrap();
+        fs::write(mirror.join("crates.io-index/se/rd/serde"), "entry").unwrap();
+        fs::write(tmp.path().join("secret"), "secret").unwrap();
+        let state = || AppState::new(mirror.clone(), None, Rescan::Never).unwrap();
+
+        let (status, body) = get(state(), "/crates/se/rd/serde/1.0.210/serde-1.0.210.crate").await;
+        assert_eq!((status, body.as_slice()), (StatusCode::OK, b"x".as_slice()));
+        let (status, body) = get(state(), "/crates.io-index/se/rd/serde").await;
+        assert_eq!(
+            (status, body.as_slice()),
+            (StatusCode::OK, b"entry".as_slice())
+        );
+
+        // Each of these is `../secret` from the `crates` or the index directory
+        for uri in [
+            "/crates/../../secret",
+            "/crates/%2e%2e/%2e%2e/secret",
+            "/crates/..%2f..%2fsecret",
+            "/crates/%2E%2E%2F%2E%2E%2Fsecret",
+            "/crates.io-index/%2e%2e/%2e%2e/secret",
+            "/crates.io-index/..%2f..%2fsecret",
+            "/crates/%2fetc%2fpasswd",
+        ] {
+            let (status, body) = get(state(), uri).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+            assert!(body.is_empty(), "{uri}");
+        }
     }
 
     #[test]

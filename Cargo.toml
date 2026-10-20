@@ -44,6 +44,7 @@ mimalloc = "0.1"
 assert_cmd = { version = "2.0.16", features = ["color", "color-auto"] }
 tempfile = "3.13.0"
 insta = "1.42.1"
+tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
 strip = true
