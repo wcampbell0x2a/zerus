@@ -1,14 +1,15 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
-use std::time::SystemTime;
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::time::{Duration, Instant, SystemTime};
 
+use anyhow::Context;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
-use axum::routing::get;
-use axum::{Json, Router};
+use axum::response::{IntoResponse, Redirect, Response};
+use axum::routing::{get, post};
+use axum::{Form, Json, Router};
 use maud::{html, Markup, PreEscaped, DOCTYPE};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -19,13 +20,293 @@ use tracing::{info, warn};
 
 use crate::get_crate_path;
 use crate::index::{extract_cargo_toml, IndexEntry};
-use crate::manifest::{self, ManifestFile};
+use crate::manifest::{self, ParsedFile};
 use crate::Crate;
 
 struct AppState {
     mirror_path: PathBuf,
-    /// Directory of manifest files from previous transfers, if `--manifests` was given
-    manifests_path: Option<PathBuf>,
+    /// The manifest pages, if `--manifests` was given
+    browse: Option<Arc<Browse>>,
+}
+
+impl AppState {
+    fn new(mirror_path: PathBuf, manifests_path: Option<PathBuf>) -> anyhow::Result<Self> {
+        let browse = manifests_path
+            .map(|manifests_path| Browse::new(mirror_path.clone(), manifests_path))
+            .transpose()?
+            .map(Arc::new);
+        Ok(Self {
+            mirror_path,
+            browse,
+        })
+    }
+}
+
+/// Threads in the scan pool. A scan waits on the disk and not on the CPU: on a network mount,
+/// each stat is a round trip. More threads keep more of these round trips in flight.
+const SCAN_THREADS: usize = 64;
+
+/// The data that the manifest pages show, and the scans that keep it current
+struct Browse {
+    mirror_path: PathBuf,
+    /// Directory of manifest files from previous transfers
+    manifests_path: PathBuf,
+    /// The result of the last scan, or `None` until the first scan is done. On a network mount,
+    /// reading the mirror takes one round trip per crate, so a scan runs only at startup and
+    /// when the user clicks Refresh. Every manifest page uses the copy that is here.
+    snapshot: RwLock<Option<Arc<Snapshot>>>,
+    /// When the running scan started, or `None` if no scan runs. Only one scan runs at a time,
+    /// so many refreshes at the same time do not each scan the whole mirror.
+    running: Mutex<Option<SystemTime>>,
+    /// The scans run on this pool and not on the global one. Each page sorts its rows on the
+    /// global pool, and a scan there would make every page wait for the scan to finish.
+    scan_pool: rayon::ThreadPool,
+}
+
+/// What a request to scan did
+#[derive(Debug)]
+enum ScanStart {
+    /// A new scan runs on this thread
+    // Only the tests wait for a scan to end
+    Started(#[cfg_attr(not(test), allow(dead_code))] std::thread::JoinHandle<()>),
+    /// A scan was already running, so no new one started
+    AlreadyRunning,
+}
+
+/// The scans as one request sees them
+struct Scans {
+    /// The result of the last scan, or `None` until the first scan is done
+    shown: Option<Arc<Snapshot>>,
+    /// When the running scan started, if a scan runs
+    running: Option<SystemTime>,
+}
+
+impl Browse {
+    fn new(mirror_path: PathBuf, manifests_path: PathBuf) -> anyhow::Result<Self> {
+        let scan_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(SCAN_THREADS)
+            .thread_name(|n| format!("scan-{n}"))
+            .build()
+            .context("failed to start the scan thread pool")?;
+
+        Ok(Self {
+            mirror_path,
+            manifests_path,
+            snapshot: RwLock::new(None),
+            running: Mutex::new(None),
+            scan_pool,
+        })
+    }
+
+    fn running(&self) -> std::sync::MutexGuard<'_, Option<SystemTime>> {
+        self.running.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn scans(&self) -> Scans {
+        // Read `running` first. A scan stores its snapshot before it clears `running`, so if
+        // this sees no running scan, the snapshot read next is at least as new as that scan.
+        let running = *self.running();
+        let shown = self
+            .snapshot
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(Arc::clone);
+        Scans { shown, running }
+    }
+
+    /// Start a scan of the mirror and the manifests on a new thread, unless one already runs.
+    /// The request does not wait for the scan: on a network mount, a scan can take minutes.
+    fn start_scan(self: &Arc<Self>) -> std::io::Result<ScanStart> {
+        let mut running = self.running();
+        if running.is_some() {
+            return Ok(ScanStart::AlreadyRunning);
+        }
+        *running = Some(SystemTime::now());
+        drop(running);
+
+        // The thread owns the guard. If the spawn fails, the closure drops, and so does the guard.
+        let done = ScanDone(Arc::clone(self));
+        let handle = std::thread::Builder::new()
+            .name("scan".to_string())
+            .spawn(move || {
+                let browse = &done.0;
+                let fresh = browse
+                    .scan_pool
+                    .install(|| Snapshot::read(&browse.mirror_path, &browse.manifests_path));
+                *browse
+                    .snapshot
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(fresh));
+            })?;
+        Ok(ScanStart::Started(handle))
+    }
+}
+
+/// Marks the scan as done when the scan thread ends, also when the scan panics. Without it,
+/// a panic would leave `running` set, and no scan could start again.
+struct ScanDone(Arc<Browse>);
+
+impl Drop for ScanDone {
+    fn drop(&mut self) {
+        *self.0.running() = None;
+    }
+}
+
+/// Each crate in the mirror, with the write time of its `.crate` file
+type WriteTimes = BTreeMap<Crate, SystemTime>;
+
+/// The crates in the mirror, as the last scan found them
+enum Mirror {
+    Read(WriteTimes),
+    /// The scan failed, so which crates are in the mirror is not known
+    Failed,
+}
+
+/// The manifest files, as the last scan found them
+enum Manifests {
+    /// The directory could not be listed
+    Unreadable,
+    Files(Vec<ParsedFile>),
+}
+
+/// Why the un-manifested crates are not known
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnmanifestedUnknown {
+    MirrorScanFailed,
+    ManifestsUnreadable,
+    ManifestParseFailed,
+}
+
+impl UnmanifestedUnknown {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::MirrorScanFailed => "the last scan could not read the mirror",
+            Self::ManifestsUnreadable => "the last scan could not read the manifests directory",
+            Self::ManifestParseFailed => {
+                "a manifest did not parse, so the crates that it records are not known"
+            }
+        }
+    }
+}
+
+/// The mirror and the manifests at one point in time
+struct Snapshot {
+    mirror: Mirror,
+    manifests: Manifests,
+    /// Mirror crates that no manifest records, in name order. The scan finds them once, so
+    /// that each load of the manifest list does not compare every manifest with the mirror.
+    unmanifested: Result<Vec<Crate>, UnmanifestedUnknown>,
+    /// When the scan started. Changes to the disk after this time can be missing.
+    started: SystemTime,
+    took: Duration,
+}
+
+impl Snapshot {
+    fn read(mirror_path: &Path, manifests_path: &Path) -> Self {
+        let started = SystemTime::now();
+        let clock = Instant::now();
+        info!("scanning the mirror at {}", mirror_path.display());
+
+        let mirror = match read_write_times(mirror_path) {
+            Ok(mirror) => {
+                info!(
+                    "found {} crate(s) in the mirror in {:.1?}",
+                    mirror.len(),
+                    clock.elapsed()
+                );
+                Mirror::Read(mirror)
+            }
+            Err(e) => {
+                warn!("failed to scan {}: {e:#}", mirror_path.display());
+                Mirror::Failed
+            }
+        };
+        let manifests = read_manifests(manifests_path);
+        let unmanifested = find_unmanifested(&mirror, &manifests);
+
+        let took = clock.elapsed();
+        info!("scan done in {took:.1?}");
+
+        Self {
+            mirror,
+            manifests,
+            unmanifested,
+            started,
+            took,
+        }
+    }
+}
+
+/// Mirror crates that no manifest records. This is known only when the scan read the mirror
+/// and every manifest.
+fn find_unmanifested(
+    mirror: &Mirror,
+    manifests: &Manifests,
+) -> Result<Vec<Crate>, UnmanifestedUnknown> {
+    let Mirror::Read(mirror) = mirror else {
+        return Err(UnmanifestedUnknown::MirrorScanFailed);
+    };
+    let Manifests::Files(files) = manifests else {
+        return Err(UnmanifestedUnknown::ManifestsUnreadable);
+    };
+    let recorded = files
+        .iter()
+        .map(|file| file.crates.as_ref())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| UnmanifestedUnknown::ManifestParseFailed)?;
+
+    Ok(
+        manifest::unmanifested(mirror.keys(), recorded.into_iter().flatten())
+            .into_iter()
+            .cloned()
+            .collect(),
+    )
+}
+
+/// Find every `.crate` file in the mirror and read its write time
+fn read_write_times(mirror_path: &Path) -> anyhow::Result<WriteTimes> {
+    // One stat per crate. On a network mount this is most of the cost, so do them in parallel.
+    // A crate culled between the scan and its stat is no longer in the mirror, so it drops out.
+    Ok(manifest::generate(mirror_path)?
+        .into_par_iter()
+        .filter_map(|krate| {
+            let written = written_at(mirror_path, &krate.name, &krate.version)?;
+            Some((krate, written))
+        })
+        .collect())
+}
+
+/// Parse each manifest file in `dir`, and log what each one holds
+fn read_manifests(dir: &Path) -> Manifests {
+    let clock = Instant::now();
+    info!("parsing the manifests in {}", dir.display());
+
+    let files = match manifest::parse_each(dir) {
+        Ok(files) => files,
+        Err(e) => {
+            warn!("failed to read manifests from {}: {e:#}", dir.display());
+            return Manifests::Unreadable;
+        }
+    };
+
+    let mut failed = 0;
+    for file in &files {
+        match &file.crates {
+            Ok(crates) => info!("parsed manifest {}: {} crate(s)", file.name, crates.len()),
+            Err(e) => {
+                failed += 1;
+                warn!("failed to parse manifest {}: {e:#}", file.name);
+            }
+        }
+    }
+    info!(
+        "parsed {} manifest file(s), {failed} failed, in {:.1?}",
+        files.len(),
+        clock.elapsed()
+    );
+
+    Manifests::Files(files)
 }
 
 #[derive(Serialize)]
@@ -185,21 +466,6 @@ async fn serve_index_file(
     }
 }
 
-/// Load the manifests dir, or `None` if `--manifests` was not given
-fn load_manifests(state: &AppState) -> Result<Option<Vec<ManifestFile>>, StatusCode> {
-    let Some(dir) = state.manifests_path.as_deref() else {
-        return Ok(None);
-    };
-
-    match manifest::load_dir(dir) {
-        Ok(manifests) => Ok(Some(manifests)),
-        Err(e) => {
-            warn!("failed to read manifests from {}: {e:#}", dir.display());
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
-        }
-    }
-}
-
 /// Modification time of the `.crate` file, or `None` if it is not in the mirror.
 /// Absent means the crate was already transferred and culled.
 fn written_at(mirror_path: &Path, name: &str, version: &str) -> Option<SystemTime> {
@@ -213,6 +479,112 @@ fn format_time(time: SystemTime) -> String {
     OffsetDateTime::from(time)
         .format(format_description!("[year]-[month]-[day] [hour]:[minute]"))
         .unwrap_or_default()
+}
+
+/// Render a time as `YYYY-MM-DD HH:MM:SS UTC`
+fn format_time_with_seconds(time: SystemTime) -> String {
+    OffsetDateTime::from(time)
+        .format(format_description!(
+            "[year]-[month]-[day] [hour]:[minute]:[second] UTC"
+        ))
+        .unwrap_or_default()
+}
+
+/// How long before `now` the time `then` was, in the largest unit that fits
+fn ago(then: SystemTime, now: SystemTime) -> String {
+    let secs = now.duration_since(then).unwrap_or_default().as_secs();
+    match secs {
+        0..=59 => "just now".to_string(),
+        60..=3599 => format!("{} min ago", secs / 60),
+        3600..=86_399 => format!("{} h ago", secs / 3600),
+        _ => format!("{} d ago", secs / 86_400),
+    }
+}
+
+/// Does the page reload itself?
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reload {
+    Never,
+    /// A scan runs, so reload until the page shows its result
+    WhileScanning,
+}
+
+/// Seconds between reloads while a scan runs
+const RELOAD_SECS: u32 = 3;
+
+/// The part of the page header that tells how old the data is
+#[derive(Clone)]
+struct StatusBar {
+    markup: Markup,
+    reload: Reload,
+}
+
+/// Tells how old the data on a page is. Gives a Refresh button that scans again and then
+/// comes back to `back`, the path of this page, or tells that a scan runs.
+fn status_bar(scans: &Scans, back: &str, now: SystemTime) -> StatusBar {
+    let markup = html! {
+        div.status {
+            @if let Some(shown) = &scans.shown {
+                span title=(format!(
+                    "The scan started {} and took {:.1} s. Changes to the disk after the start can be missing.",
+                    format_time_with_seconds(shown.started),
+                    shown.took.as_secs_f64()
+                )) {
+                    "data from " (ago(shown.started, now))
+                }
+                " · "
+            }
+            @match scans.running {
+                Some(started) => span { "scan running since " (format_time_with_seconds(started)) "…" },
+                None => (refresh_button(back)),
+            }
+        }
+    };
+    let reload = match scans.running {
+        Some(_) => Reload::WhileScanning,
+        None => Reload::Never,
+    };
+    StatusBar { markup, reload }
+}
+
+/// A POST and not a link, so that a reload, a bookmark, or a link prefetch does not start a
+/// scan of the whole mirror
+fn refresh_button(back: &str) -> Markup {
+    html! {
+        form.refresh action="/refresh" method="post" {
+            input type="hidden" name="back" value=(back);
+            button.link type="submit" { "Refresh" }
+        }
+    }
+}
+
+/// `back` if it is a path on this server, else `/`. This stops the refresh form from sending
+/// the user to another site, and it keeps the redirect a valid header value.
+fn local_path(back: Option<&str>) -> &str {
+    match back {
+        Some(path)
+            if path.starts_with('/')
+                && !path.starts_with("//")
+                && !path.starts_with("/\\")
+                && path.bytes().all(|b| b.is_ascii_graphic()) =>
+        {
+            path
+        }
+        _ => "/",
+    }
+}
+
+/// Percent-encode `value` for use in a URL query
+fn encode_query(value: &str) -> String {
+    value
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                char::from(b).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 /// Column a crate listing is ordered by
@@ -278,7 +650,7 @@ impl FromStr for Show {
 const PAGE_SIZE: usize = 1000;
 
 /// A crate in a listing, paired with the write time of its `.crate` file.
-/// `written` is `None` for a culled crate, which no longer has a file to stat.
+/// `written` is `None` for a culled crate, which no longer has a file.
 struct Listed<'a> {
     krate: &'a Crate,
     written: Option<SystemTime>,
@@ -292,13 +664,16 @@ impl Listed<'_> {
 
 /// Pair each crate with its write time and order the result by `sort`.
 /// Newest first when sorting by write time; culled crates have no time, so they sort last.
-fn listing<'a>(mirror_path: &Path, crates: &'a [Crate], sort: Sort) -> Vec<Listed<'a>> {
-    // One stat per crate. On a slow disk this is the cost of the page, so do them in parallel.
+fn listing<'a>(
+    crates: impl IntoIterator<Item = &'a Crate>,
+    mirror: &WriteTimes,
+    sort: Sort,
+) -> Vec<Listed<'a>> {
     let mut listed: Vec<Listed<'a>> = crates
-        .par_iter()
+        .into_iter()
         .map(|krate| Listed {
             krate,
-            written: written_at(mirror_path, &krate.name, &krate.version),
+            written: mirror.get(krate).copied(),
         })
         .collect();
 
@@ -433,7 +808,7 @@ fn crate_table(rows: &[&Listed<'_>], view: View<'_>) -> Markup {
                 tr {
                     th { (sort_link(view, "crate", Sort::Name)) }
                     th { "version" }
-                    th { (sort_link(view, "written", Sort::Written)) }
+                    th { (sort_link(view, "written (UTC)", Sort::Written)) }
                 }
             }
             tbody {
@@ -500,26 +875,46 @@ enum Focus {
     Page,
 }
 
-fn page(title: &str, body: Markup) -> Markup {
-    page_with_search(title, "", Focus::Page, body)
+fn page(title: &str, status: Option<StatusBar>, body: Markup) -> Markup {
+    page_with_search(title, "", Focus::Page, status, body)
 }
 
-/// The page shell. The search box lives in the header, so it is on every page.
-fn page_with_search(title: &str, query: &str, focus: Focus, body: Markup) -> Markup {
+/// The page shell. The header holds the links, the search box, and the scan status, so they
+/// are on every page.
+fn page_with_search(
+    title: &str,
+    query: &str,
+    focus: Focus,
+    status: Option<StatusBar>,
+    body: Markup,
+) -> Markup {
+    let reload = status
+        .as_ref()
+        .map_or(Reload::Never, |status| status.reload);
     html! {
         (DOCTYPE)
         html lang="en" {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
+                @if reload == Reload::WhileScanning {
+                    meta http-equiv="refresh" content=(RELOAD_SECS);
+                }
                 title { (title) }
                 style { (PAGE_CSS) }
             }
             body {
                 header {
-                    a href="/" { "zerus" }
-                    span.version { "v" (env!("CARGO_PKG_VERSION")) }
+                    nav.site {
+                        a.home href="/" { "zerus" }
+                        span.version { "v" (env!("CARGO_PKG_VERSION")) }
+                        a href="/" { "manifests" }
+                        a href="/unmanifested" { "un-manifested" }
+                    }
                     (search_form(query, focus))
+                    @if let Some(status) = status {
+                        (status.markup)
+                    }
                 }
                 main { (body) }
                 script { (PreEscaped(SEARCH_SHORTCUT_JS)) }
@@ -535,10 +930,16 @@ const PAGE_CSS: &str = "\
 body { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Cascadia Mono',
        'DejaVu Sans Mono', 'Liberation Mono', monospace; margin: 0 auto;
        max-width: 60rem; padding: 1.5rem; line-height: 1.5; }
-header { border-bottom: 1px solid currentColor; margin-bottom: 1.5rem; padding-bottom: .5rem; }
-header a { font-weight: bold; text-decoration: none; color: inherit; }
-header .version { margin-left: .5rem; font-size: .85em;
+header { border-bottom: 1px solid currentColor; margin-bottom: 1.5rem; padding-bottom: .5rem;
+         display: flex; flex-wrap: wrap; align-items: baseline; gap: .5rem 1rem; }
+nav.site a { margin-right: 1rem; color: inherit; }
+nav.site a.home { font-weight: bold; text-decoration: none; margin-right: .5rem; }
+header .version { margin-right: 1.5rem; font-size: .85em;
                   color: color-mix(in srgb, currentColor 65%, transparent); }
+.status { flex-basis: 100%; text-align: right; font-size: .85em;
+          color: color-mix(in srgb, currentColor 65%, transparent); }
+button.link { font: inherit; color: inherit; background: none; border: 0; padding: 0;
+              text-decoration: underline; cursor: pointer; }
 table { border-collapse: collapse; width: 100%; }
 td, th { text-align: left; padding: .25rem .75rem .25rem 0; }
 th { border-bottom: 1px solid currentColor; }
@@ -547,12 +948,15 @@ tr + tr td { border-top: 1px solid color-mix(in srgb, currentColor 15%, transpar
 .count { color: color-mix(in srgb, currentColor 65%, transparent); }
 input[type=search] { font: inherit; padding: .3rem; min-width: 16rem; }
 p.empty { color: color-mix(in srgb, currentColor 65%, transparent); }
+p.crumbs { margin-bottom: 0; }
 nav.pages { margin: .75rem 0; }
 nav.pages a, nav.pages span { margin-right: .75rem; }
 a.sort { color: inherit; text-decoration: none; }
 a.sort:hover { text-decoration: underline; }
 a.sort.active::after { content: ' \\2193'; }
-form.search { display: inline; margin-left: 1rem; }
+form.search, form.refresh { display: inline; }
+form.search { margin-left: auto; }
+.error { color: #c62828; }
 ";
 
 // `s` and `/` focus the search box, the same keys docs.rs binds. Ctrl+S is left alone so
@@ -573,12 +977,42 @@ document.addEventListener('keydown', function (e) {
 });
 ";
 
+/// A page in place of the one that the request asked for, with the status that tells why
+#[derive(Debug)]
+struct ErrorPage {
+    status: StatusCode,
+    body: Markup,
+}
+
+impl ErrorPage {
+    fn new(status: StatusCode, title: &str, bar: Option<StatusBar>, message: Markup) -> Self {
+        Self {
+            status,
+            body: page(
+                &format!("{title} - zerus"),
+                bar,
+                html! {
+                    h1 { (title) }
+                    (message)
+                },
+            ),
+        }
+    }
+}
+
+impl IntoResponse for ErrorPage {
+    fn into_response(self) -> Response {
+        (self.status, self.body).into_response()
+    }
+}
+
 /// Shown when --manifests was not passed
-fn no_manifests_page() -> Markup {
-    page(
-        "manifests - zerus",
+fn no_manifests_page() -> ErrorPage {
+    ErrorPage::new(
+        StatusCode::NOT_FOUND,
+        "No manifests directory",
+        None,
         html! {
-            h1 { "No manifests directory" }
             p {
                 "Start the server with "
                 code { "--manifests <DIR>" }
@@ -587,6 +1021,59 @@ fn no_manifests_page() -> Markup {
                 "."
             }
             pre { "zerus serve <mirror> --manifests transfers/" }
+        },
+    )
+}
+
+/// The scans and the status bar for a manifest page at `back`, or the page to show instead
+fn page_scans(state: &AppState, back: &str) -> Result<(Scans, StatusBar), ErrorPage> {
+    let browse = state.browse.as_deref().ok_or_else(no_manifests_page)?;
+    let scans = browse.scans();
+    let bar = status_bar(&scans, back, SystemTime::now());
+    Ok((scans, bar))
+}
+
+/// The snapshot that a manifest page shows, or a page that tells why there is none yet
+fn shown(scans: &Scans, bar: &StatusBar) -> Result<Arc<Snapshot>, ErrorPage> {
+    scans.shown.clone().ok_or_else(|| {
+        ErrorPage::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Scan in progress",
+            Some(bar.clone()),
+            html! {
+                @match scans.running {
+                    Some(_) => p {
+                        "The first scan of the mirror and the manifests is still running. "
+                        "This page reloads when it is done."
+                    },
+                    None => p { "No scan is done yet. Click Refresh to start one." },
+                }
+            },
+        )
+    })
+}
+
+fn mirror_scan_failed(bar: &StatusBar) -> ErrorPage {
+    ErrorPage::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Mirror scan failed",
+        Some(bar.clone()),
+        html! {
+            p {
+                "The last scan could not read the mirror, so this page cannot tell which "
+                "crates are in it. The server log gives the cause."
+            }
+        },
+    )
+}
+
+fn manifests_unreadable(bar: &StatusBar) -> ErrorPage {
+    ErrorPage::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Manifests directory not readable",
+        Some(bar.clone()),
+        html! {
+            p { "The last scan could not read the manifests directory. The server log gives the cause." }
         },
     )
 }
@@ -604,45 +1091,74 @@ fn search_form(query: &str, focus: Focus) -> Markup {
 }
 
 /// Index: every manifest file with its crate count
-async fn manifests_index(State(state): State<Arc<AppState>>) -> Result<Markup, StatusCode> {
+async fn manifests_index(State(state): State<Arc<AppState>>) -> Result<Markup, ErrorPage> {
     blocking(move || manifests_index_page(&state)).await
 }
 
-fn manifests_index_page(state: &AppState) -> Result<Markup, StatusCode> {
-    let Some(manifests) = load_manifests(state)? else {
-        return Ok(no_manifests_page());
+fn manifests_index_page(state: &AppState) -> Result<Markup, ErrorPage> {
+    let (scans, bar) = page_scans(state, "/")?;
+    let snapshot = shown(&scans, &bar)?;
+    let Manifests::Files(files) = &snapshot.manifests else {
+        return Err(manifests_unreadable(&bar));
     };
 
     // A crate is only in the mirror because someone put it there, so this page always
-    // offers the un-manifested view, even when no manifest file exists yet.
-    let unmanifested_count = manifest::unmanifested(&state.mirror_path, &manifests)
-        .map(|crates| crates.len())
-        .unwrap_or_default();
-
+    // offers the un-manifested view, even when no manifest file exists yet. It comes first,
+    // as it lists the crates of the next transfer.
     Ok(page(
-        "crates - zerus",
+        "manifests - zerus",
+        Some(bar),
         html! {
-            h1 { "Crates" }
+            h1 { "Manifests" }
             table {
                 thead { tr { th { "manifest" } th { "crates" } } }
                 tbody {
-                    @for m in &manifests {
-                        tr {
-                            td { a href={ "/manifests/" (m.name) } { (m.name) } }
-                            td.count { (m.crates.len()) }
-                        }
-                    }
                     tr {
                         td { a href="/unmanifested" { "(un-manifested)" } }
-                        td.count { (unmanifested_count) }
+                        @match &snapshot.unmanifested {
+                            Ok(crates) => td.count { (crates.len()) },
+                            Err(_) => td.error { "not known" },
+                        }
+                    }
+                    // Newest first, for names that start with the date, as the README shows
+                    @for file in files.iter().rev() {
+                        tr {
+                            td { a href={ "/manifests/" (file.name) } { (file.name) } }
+                            @match &file.crates {
+                                Ok(crates) => td.count { (crates.len()) },
+                                Err(_) => td.error { "did not parse" },
+                            }
+                        }
                     }
                 }
             }
-            @if manifests.is_empty() {
+            @if files.is_empty() {
                 p.empty { "No manifest files found." }
+            }
+            @if let Err(why) = snapshot.unmanifested {
+                p.error { "The un-manifested count is not known: " (why.reason()) "." }
             }
         },
     ))
+}
+
+#[derive(serde::Deserialize)]
+struct RefreshForm {
+    /// The page to go back to after the scan starts
+    back: Option<String>,
+}
+
+/// Start a scan of the mirror and the manifests, then go back to the page that asked. That
+/// page shows the running scan, and reloads until the scan is done.
+async fn refresh(State(state): State<Arc<AppState>>, Form(form): Form<RefreshForm>) -> Redirect {
+    if let Some(browse) = &state.browse {
+        match browse.start_scan() {
+            Ok(ScanStart::Started(_)) => info!("refresh started a scan"),
+            Ok(ScanStart::AlreadyRunning) => info!("refresh found a scan already running"),
+            Err(e) => warn!("failed to start a scan: {e}"),
+        }
+    }
+    Redirect::to(local_path(form.back.as_deref()))
 }
 
 /// Detail: the crates listed in one manifest, split into present and culled
@@ -650,7 +1166,7 @@ async fn manifest_detail(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(name): axum::extract::Path<String>,
     Query(params): Query<ListParams>,
-) -> Result<Markup, StatusCode> {
+) -> Result<Markup, ErrorPage> {
     blocking(move || manifest_detail_page(&state, &name, params)).await
 }
 
@@ -658,31 +1174,55 @@ fn manifest_detail_page(
     state: &AppState,
     name: &str,
     params: ListParams,
-) -> Result<Markup, StatusCode> {
-    let Some(dir) = state.manifests_path.as_deref() else {
-        return Ok(no_manifests_page());
+) -> Result<Markup, ErrorPage> {
+    let base = format!("/manifests/{name}");
+    let view = params.view(&base);
+    let (scans, bar) = page_scans(state, &view.href())?;
+    let snapshot = shown(&scans, &bar)?;
+    let Manifests::Files(files) = &snapshot.manifests else {
+        return Err(manifests_unreadable(&bar));
     };
 
-    // Parse only the one file, so the page cost does not grow with the number of manifests
-    let found = manifest::load_one(dir, name)
-        .map_err(|e| {
-            warn!(
-                "failed to read manifest {name} from {}: {e:#}",
-                dir.display()
-            );
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
-        .ok_or(StatusCode::NOT_FOUND)?;
+    // Match against the listing, so a name such as `../secret` cannot reach another file.
+    // A bad file elsewhere does not stop this page, only the bad file's own page.
+    let found = files.iter().find(|file| file.name == name).ok_or_else(|| {
+        ErrorPage::new(
+            StatusCode::NOT_FOUND,
+            "Manifest not found",
+            Some(bar.clone()),
+            html! {
+                p {
+                    "The last scan found no manifest named " code { (name) } ". "
+                    "If you added it after that scan, click Refresh."
+                }
+            },
+        )
+    })?;
+    let crates = found.crates.as_ref().map_err(|e| {
+        ErrorPage::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Manifest did not parse",
+            Some(bar.clone()),
+            html! {
+                p { "The manifest " code { (name) } " did not parse:" }
+                pre { (format!("{e:#}")) }
+                p { "Correct the file, then click Refresh." }
+            },
+        )
+    })?;
+    let Mirror::Read(mirror) = &snapshot.mirror else {
+        return Err(mirror_scan_failed(&bar));
+    };
 
-    let base = format!("/manifests/{}", found.name);
-    let view = params.view(&base);
-    let listed = listing(&state.mirror_path, &found.crates, view.sort);
+    let listed = listing(crates, mirror, view.sort);
     let (present, culled) = split_culled(&listed);
 
     Ok(page(
-        &format!("{} - zerus", found.name),
+        &format!("{name} - zerus"),
+        Some(bar),
         html! {
-            h1 { (found.name) }
+            p.crumbs { a href="/" { "manifests" } " /" }
+            h1 { (name) }
             p.count {
                 (listed.len()) " crate(s), " (present.len()) " still in mirror, "
                 (culled.len()) " culled"
@@ -719,31 +1259,43 @@ fn manifest_detail_page(
 async fn unmanifested(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ListParams>,
-) -> Result<Markup, StatusCode> {
+) -> Result<Markup, ErrorPage> {
     blocking(move || unmanifested_page(&state, params)).await
 }
 
-fn unmanifested_page(state: &AppState, params: ListParams) -> Result<Markup, StatusCode> {
-    let Some(manifests) = load_manifests(state)? else {
-        return Ok(no_manifests_page());
-    };
-
-    let crates = manifest::unmanifested(&state.mirror_path, &manifests).map_err(|e| {
-        warn!("failed to scan {}: {e:#}", state.mirror_path.display());
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+fn unmanifested_page(state: &AppState, params: ListParams) -> Result<Markup, ErrorPage> {
     // Every entry comes from a file in the mirror, so none of them can be culled.
     let view = ListParams {
         show: None,
         ..params
     }
     .view("/unmanifested");
-    let listed = listing(&state.mirror_path, &crates, view.sort);
+    let (scans, bar) = page_scans(state, &view.href())?;
+    let snapshot = shown(&scans, &bar)?;
+
+    let crates = snapshot.unmanifested.as_ref().map_err(|why| {
+        ErrorPage::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Un-manifested crates not known",
+            Some(bar.clone()),
+            html! {
+                p { "This page cannot list the un-manifested crates: " (why.reason()) "." }
+            },
+        )
+    })?;
+    // The un-manifested crates are known only after a good mirror scan, so this always matches
+    let Mirror::Read(mirror) = &snapshot.mirror else {
+        return Err(mirror_scan_failed(&bar));
+    };
+
+    let listed = listing(crates, mirror, view.sort);
     let all: Vec<&Listed<'_>> = listed.iter().collect();
 
     Ok(page(
         "un-manifested - zerus",
+        Some(bar),
         html! {
+            p.crumbs { a href="/" { "manifests" } " /" }
             h1 { "Un-manifested" }
             p.count { (all.len()) " crate(s) in the mirror that no manifest records" }
             @if all.is_empty() {
@@ -758,13 +1310,18 @@ fn unmanifested_page(state: &AppState, params: ListParams) -> Result<Markup, Sta
 /// Run blocking page work on the blocking thread pool. The manifest pages read and stat
 /// many files; on the async runtime, a slow disk would stall every other request too.
 async fn blocking(
-    render: impl FnOnce() -> Result<Markup, StatusCode> + Send + 'static,
-) -> Result<Markup, StatusCode> {
+    render: impl FnOnce() -> Result<Markup, ErrorPage> + Send + 'static,
+) -> Result<Markup, ErrorPage> {
     tokio::task::spawn_blocking(render)
         .await
         .unwrap_or_else(|e| {
             warn!("page render task failed: {e}");
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            Err(ErrorPage::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal error",
+                None,
+                html! { p { "The page failed to render. The server log gives the cause." } },
+            ))
         })
 }
 
@@ -777,27 +1334,33 @@ struct ManifestSearchParams {
 async fn manifest_search(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ManifestSearchParams>,
-) -> Result<Markup, StatusCode> {
+) -> Result<Markup, ErrorPage> {
     blocking(move || manifest_search_page(&state, params)).await
 }
 
 fn manifest_search_page(
     state: &AppState,
     params: ManifestSearchParams,
-) -> Result<Markup, StatusCode> {
-    let Some(manifests) = load_manifests(state)? else {
-        return Ok(no_manifests_page());
+) -> Result<Markup, ErrorPage> {
+    let query = params.q.unwrap_or_default();
+    let (scans, bar) = page_scans(state, &format!("/search?q={}", encode_query(&query)))?;
+    let snapshot = shown(&scans, &bar)?;
+    let Manifests::Files(files) = &snapshot.manifests else {
+        return Err(manifests_unreadable(&bar));
     };
 
-    let query = params.q.unwrap_or_default();
     let needle = query.to_lowercase();
+    let parsed = files
+        .iter()
+        .filter_map(|file| Some((file.name.as_str(), file.crates.as_ref().ok()?)));
+    let unparsed = files.iter().filter(|file| file.crates.is_err()).count();
 
     let mut hits: Vec<(&str, &str, &str)> = Vec::new();
     if !needle.is_empty() {
-        for m in &manifests {
-            for c in &m.crates {
+        for (file, crates) in parsed {
+            for c in crates {
                 if c.name.to_lowercase().contains(&needle) {
-                    hits.push((c.name.as_str(), c.version.as_str(), m.name.as_str()));
+                    hits.push((c.name.as_str(), c.version.as_str(), file));
                 }
             }
         }
@@ -808,8 +1371,12 @@ fn manifest_search_page(
         "search - zerus",
         &query,
         Focus::Search,
+        Some(bar),
         html! {
             h1 { "Search" }
+            @if unparsed > 0 {
+                p.error { (unparsed) " manifest(s) did not parse, so the search leaves them out." }
+            }
             @if query.is_empty() {
                 p.empty { "Enter a crate name." }
             } @else if hits.is_empty() {
@@ -835,6 +1402,7 @@ fn manifest_search_page(
 fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(manifests_index))
+        .route("/refresh", post(refresh))
         .route("/manifests/{name}", get(manifest_detail))
         .route("/unmanifested", get(unmanifested))
         .route("/search", get(manifest_search))
@@ -850,11 +1418,16 @@ pub fn serve(
     bind: String,
     manifests_path: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    let app = router(Arc::new(AppState {
-        mirror_path,
-        manifests_path,
-    }));
+    let state = Arc::new(AppState::new(mirror_path, manifests_path)?);
 
+    // The first scan runs in the background, so that cargo can use the registry at once
+    if let Some(browse) = &state.browse {
+        browse
+            .start_scan()
+            .context("failed to start the first scan")?;
+    }
+
+    let app = router(state);
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let listener = tokio::net::TcpListener::bind(&bind).await?;
@@ -890,7 +1463,13 @@ mod tests {
 
     #[test]
     fn list_params_ignore_bad_and_missing_values() {
-        for query in ["", "sort=zzz&show=all&page=abc", "page=-1", "page=", "sort=Name"] {
+        for query in [
+            "",
+            "sort=zzz&show=all&page=abc",
+            "page=-1",
+            "page=",
+            "sort=Name",
+        ] {
             let p = params(query);
             assert_eq!(p.sort, None, "{query}");
             assert_eq!(p.show, None, "{query}");
@@ -998,7 +1577,8 @@ mod tests {
         fs::write(dir.join(format!("{name}-{version}.crate")), b"x").unwrap();
     }
 
-    /// A mirror holding `serde` and `tokio`, and a manifest that also lists the culled `axum`
+    /// A mirror holding `serde` and `tokio`, and a manifest that also lists the culled `axum`.
+    /// The first scan is done.
     fn fixture() -> (tempfile::TempDir, AppState) {
         let tmp = tempfile::tempdir().unwrap();
         let mirror = tmp.path().join("mirror");
@@ -1014,15 +1594,75 @@ mod tests {
         // A broken manifest elsewhere must not break the page of `a.txt`
         fs::write(manifests.join("broken.txt"), "nope\n").unwrap();
 
-        let state = AppState {
-            mirror_path: mirror,
-            manifests_path: Some(manifests),
-        };
+        let state = AppState::new(mirror, Some(manifests)).unwrap();
+        rescan(&state);
         (tmp, state)
     }
 
+    fn browse(state: &AppState) -> &Arc<Browse> {
+        state.browse.as_ref().unwrap()
+    }
+
+    fn manifests_dir(state: &AppState) -> PathBuf {
+        browse(state).manifests_path.clone()
+    }
+
+    /// Scan, wait for the scan to end, and give its result
+    fn rescan(state: &AppState) -> Arc<Snapshot> {
+        match browse(state).start_scan().unwrap() {
+            ScanStart::Started(handle) => handle.join().unwrap(),
+            ScanStart::AlreadyRunning => panic!("a scan already runs"),
+        }
+        browse(state).scans().shown.unwrap()
+    }
+
+    /// Wait for a scan that this thread did not start
+    fn wait_for_scan(browse: &Browse) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while browse.scans().running.is_some() {
+            assert!(Instant::now() < deadline, "the scan did not end");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The fixture without `broken.txt`, scanned again
+    fn clean_fixture() -> (tempfile::TempDir, AppState) {
+        let (tmp, state) = fixture();
+        fs::remove_file(manifests_dir(&state).join("broken.txt")).unwrap();
+        rescan(&state);
+        (tmp, state)
+    }
+
+    /// Write a manifest file and read it into the cache
+    fn add_manifest(state: &AppState, name: &str, contents: &str) {
+        fs::write(manifests_dir(state).join(name), contents).unwrap();
+        rescan(state);
+    }
+
+    fn render(page: Result<Markup, ErrorPage>) -> Result<String, StatusCode> {
+        page.map(Markup::into_string).map_err(|e| e.status)
+    }
+
+    fn error_body(page: Result<Markup, ErrorPage>) -> (StatusCode, String) {
+        let e = page.unwrap_err();
+        (e.status, e.body.into_string())
+    }
+
     fn detail(state: &AppState, name: &str, query: &str) -> Result<String, StatusCode> {
-        manifest_detail_page(state, name, params(query)).map(Markup::into_string)
+        render(manifest_detail_page(state, name, params(query)))
+    }
+
+    fn index(state: &AppState) -> Result<String, StatusCode> {
+        render(manifests_index_page(state))
+    }
+
+    fn search(state: &AppState, q: &str) -> Result<String, StatusCode> {
+        render(manifest_search_page(
+            state,
+            ManifestSearchParams {
+                q: Some(q.to_string()),
+            },
+        ))
     }
 
     #[test]
@@ -1059,8 +1699,7 @@ mod tests {
     #[test]
     fn detail_with_nothing_culled_has_no_culled_link() {
         let (_tmp, state) = fixture();
-        let dir = state.manifests_path.as_deref().unwrap();
-        fs::write(dir.join("b.txt"), "serde@1.0.210\n").unwrap();
+        add_manifest(&state, "b.txt", "serde@1.0.210\n");
 
         let html = detail(&state, "b.txt", "").unwrap();
         assert!(!html.contains("show culled"));
@@ -1072,8 +1711,7 @@ mod tests {
     #[test]
     fn detail_with_everything_culled_says_so() {
         let (_tmp, state) = fixture();
-        let dir = state.manifests_path.as_deref().unwrap();
-        fs::write(dir.join("b.txt"), "axum@0.8.1\n").unwrap();
+        add_manifest(&state, "b.txt", "axum@0.8.1\n");
 
         let html = detail(&state, "b.txt", "").unwrap();
 
@@ -1086,27 +1724,547 @@ mod tests {
         let (_tmp, state) = fixture();
         assert_eq!(detail(&state, "nope.txt", ""), Err(StatusCode::NOT_FOUND));
         assert_eq!(detail(&state, "../mirror", ""), Err(StatusCode::NOT_FOUND));
+
+        let no_dir = AppState::new(state.mirror_path.clone(), None).unwrap();
+        let (status, html) = error_body(manifest_detail_page(&no_dir, "a.txt", params("")));
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(html.contains("No manifests directory"), "{html}");
+
+        let gone_dir = AppState::new(
+            state.mirror_path.clone(),
+            Some(state.mirror_path.join("nope")),
+        )
+        .unwrap();
+        rescan(&gone_dir);
+        let (status, html) = error_body(manifest_detail_page(&gone_dir, "a.txt", params("")));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(html.contains("Manifests directory not readable"), "{html}");
+    }
+
+    #[test]
+    fn detail_of_a_bad_manifest_shows_the_parse_error() {
+        let (_tmp, state) = fixture();
+
+        let (status, html) = error_body(manifest_detail_page(&state, "broken.txt", params("")));
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            html.contains("broken.txt:1: expected name@version"),
+            "{html}"
+        );
+        assert!(html.contains(r#"action="/refresh""#), "{html}");
+    }
+
+    #[test]
+    fn detail_of_a_new_manifest_tells_the_user_to_refresh() {
+        let (_tmp, state) = fixture();
+        fs::write(manifests_dir(&state).join("b.txt"), "serde@1.0.210\n").unwrap();
+
+        let (status, html) = error_body(manifest_detail_page(&state, "b.txt", params("")));
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(html.contains("click Refresh"), "{html}");
+        // The refresh comes back to this page
+        assert!(
+            html.contains(r#"name="back" value="/manifests/b.txt?sort=name""#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn manifest_pages_use_the_cache_until_a_refresh() {
+        let (_tmp, state) = clean_fixture();
+        let dir = manifests_dir(&state);
+        fs::write(dir.join("b.txt"), "tokio@1.40.0\n").unwrap();
+        // Cull `tokio` from the mirror
+        let tokio = get_crate_path(&state.mirror_path, "tokio", "1.40.0").unwrap();
+        fs::remove_dir_all(&tokio).unwrap();
+
+        // The cache is from before the changes, and a load of the list does not scan
+        assert!(!index(&state).unwrap().contains("b.txt"));
+        assert_eq!(detail(&state, "b.txt", ""), Err(StatusCode::NOT_FOUND));
+        let html = detail(&state, "a.txt", "").unwrap();
+        assert!(html.contains("2 still in mirror, 1 culled"), "{html}");
+
+        rescan(&state);
+
+        assert!(index(&state).unwrap().contains("b.txt"));
+        let html = detail(&state, "b.txt", "").unwrap();
+        assert!(
+            html.contains("1 crate(s), 0 still in mirror, 1 culled"),
+            "{html}"
+        );
+        let html = detail(&state, "a.txt", "").unwrap();
+        assert!(html.contains("1 still in mirror, 2 culled"), "{html}");
+    }
+
+    #[test]
+    fn pages_wait_for_the_first_scan() {
+        let (tmp, _) = fixture();
+        let state = AppState::new(
+            tmp.path().join("mirror"),
+            Some(tmp.path().join("manifests")),
+        )
+        .unwrap();
+        *browse(&state).running() = Some(SystemTime::now());
+
+        let (status, html) = error_body(manifests_index_page(&state));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(html.contains("still running"), "{html}");
+        assert!(html.contains("scan running since"), "{html}");
+        assert!(
+            html.contains(r#"<meta http-equiv="refresh" content="3">"#),
+            "{html}"
+        );
+        assert!(!html.contains(r#"action="/refresh""#), "{html}");
+        for page in [
+            detail(&state, "a.txt", ""),
+            render(unmanifested_page(&state, params(""))),
+            search(&state, "serde"),
+        ] {
+            assert_eq!(page, Err(StatusCode::SERVICE_UNAVAILABLE));
+        }
+
+        *browse(&state).running() = None;
+        rescan(&state);
+        let list = index(&state).unwrap();
+        assert!(!list.contains("http-equiv"), "{list}");
+    }
+
+    #[test]
+    fn with_no_scan_at_all_the_page_offers_refresh() {
+        let (tmp, _) = fixture();
+        let state = AppState::new(
+            tmp.path().join("mirror"),
+            Some(tmp.path().join("manifests")),
+        )
+        .unwrap();
+
+        let (status, html) = error_body(manifests_index_page(&state));
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(html.contains("Click Refresh to start one"), "{html}");
+        assert!(html.contains(r#"action="/refresh""#), "{html}");
+        assert!(!html.contains("http-equiv"), "{html}");
+    }
+
+    #[test]
+    fn no_manifests_dir_needs_no_scan() {
+        let (tmp, _) = fixture();
+        let state = AppState::new(tmp.path().join("mirror"), None).unwrap();
+
+        assert!(state.browse.is_none());
+        let (status, html) = error_body(manifests_index_page(&state));
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(html.contains("No manifests directory"), "{html}");
+        assert!(!html.contains(r#"class="status""#), "{html}");
+    }
+
+    #[test]
+    fn each_scan_gives_a_new_snapshot() {
+        let (_tmp, state) = fixture();
+        let first = browse(&state).scans().shown.unwrap();
+
+        let second = rescan(&state);
+
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(browse(&state).scans().running.is_none());
+    }
+
+    #[test]
+    fn only_one_scan_runs_at_a_time() {
+        let (_tmp, state) = fixture();
+        let since = SystemTime::now();
+        *browse(&state).running() = Some(since);
+
+        assert!(matches!(
+            browse(&state).start_scan().unwrap(),
+            ScanStart::AlreadyRunning
+        ));
+        // The running scan keeps its start time
+        assert_eq!(browse(&state).scans().running, Some(since));
+    }
+
+    #[test]
+    fn a_scan_that_panics_still_lets_the_next_scan_start() {
+        let (_tmp, state) = fixture();
+        *browse(&state).running() = Some(SystemTime::now());
+
+        let done = ScanDone(Arc::clone(browse(&state)));
+        let result = std::thread::spawn(move || {
+            let _done = done;
+            panic!("scan failed");
+        })
+        .join();
+
+        assert!(result.is_err());
+        assert!(browse(&state).scans().running.is_none());
+        rescan(&state);
+    }
+
+    #[test]
+    fn concurrent_starts_never_run_two_scans() {
+        let (_tmp, state) = fixture();
+        let browse = Arc::clone(browse(&state));
+
+        let starts: Vec<ScanStart> = (0..8)
+            .map(|_| {
+                let browse = Arc::clone(&browse);
+                std::thread::spawn(move || browse.start_scan().unwrap())
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .collect();
+
+        // A scan can end before the next start, so more than one can start, one after another
+        let started = starts
+            .into_iter()
+            .filter_map(|start| match start {
+                ScanStart::Started(handle) => Some(handle),
+                ScanStart::AlreadyRunning => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!started.is_empty());
+        for handle in started {
+            handle.join().unwrap();
+        }
+        assert!(browse.scans().running.is_none());
+    }
+
+    #[tokio::test]
+    async fn refresh_starts_a_scan_and_goes_back_at_once() {
+        let (_tmp, state) = clean_fixture();
+        fs::write(manifests_dir(&state).join("b.txt"), "serde@1.0.210\n").unwrap();
+        let state = Arc::new(state);
+
+        let response = refresh(
+            State(Arc::clone(&state)),
+            Form(RefreshForm {
+                back: Some("/manifests/b.txt?sort=written".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
         assert_eq!(
-            detail(&state, "broken.txt", ""),
+            response.headers()["location"],
+            "/manifests/b.txt?sort=written"
+        );
+        wait_for_scan(browse(&state));
+        assert!(detail(&state, "b.txt", "").is_ok());
+    }
+
+    #[tokio::test]
+    async fn refresh_without_a_manifests_dir_goes_back() {
+        let (tmp, _) = fixture();
+        let state = Arc::new(AppState::new(tmp.path().join("mirror"), None).unwrap());
+
+        let response = refresh(State(state), Form(RefreshForm { back: None }))
+            .await
+            .into_response();
+
+        assert_eq!(response.headers()["location"], "/");
+    }
+
+    #[test]
+    fn ago_uses_the_largest_unit_that_fits() {
+        let then = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        for (secs, text) in [
+            (0, "just now"),
+            (59, "just now"),
+            (60, "1 min ago"),
+            (3599, "59 min ago"),
+            (3600, "1 h ago"),
+            (86_399, "23 h ago"),
+            (86_400, "1 d ago"),
+            (10 * 86_400, "10 d ago"),
+        ] {
+            assert_eq!(ago(then, then + Duration::from_secs(secs)), text, "{secs}");
+        }
+        // A clock that went back gives no negative age
+        assert_eq!(ago(then, then - Duration::from_secs(5)), "just now");
+    }
+
+    #[test]
+    fn status_bar_offers_refresh_only_when_no_scan_runs() {
+        let (_tmp, state) = fixture();
+        let shown = browse(&state).scans().shown;
+        let now = shown.as_ref().unwrap().started + Duration::from_secs(180);
+
+        let idle = status_bar(
+            &Scans {
+                shown: shown.clone(),
+                running: None,
+            },
+            "/x",
+            now,
+        );
+        let html = idle.markup.into_string();
+        assert_eq!(idle.reload, Reload::Never);
+        assert!(html.contains("data from 3 min ago"), "{html}");
+        assert!(html.contains(r#"title="The scan started "#), "{html}");
+        assert!(html.contains(r#"name="back" value="/x""#), "{html}");
+
+        let busy = status_bar(
+            &Scans {
+                shown,
+                running: Some(now),
+            },
+            "/x",
+            now,
+        );
+        let html = busy.markup.into_string();
+        assert_eq!(busy.reload, Reload::WhileScanning);
+        assert!(html.contains("data from 3 min ago"), "{html}");
+        assert!(html.contains("scan running since"), "{html}");
+        assert!(!html.contains("Refresh"), "{html}");
+    }
+
+    #[test]
+    fn local_path_keeps_paths_on_this_server() {
+        for path in ["/", "/manifests/a.txt?sort=name&page=2", "/search?q=a%20b"] {
+            assert_eq!(local_path(Some(path)), path);
+        }
+    }
+
+    #[test]
+    fn local_path_rejects_other_sites_and_bad_header_values() {
+        for path in [
+            "",
+            "manifests/a.txt",
+            "//evil.example",
+            "/\\evil.example",
+            "https://evil.example/",
+            "/a\r\nSet-Cookie: x=1",
+            "/a b",
+            "/caf\u{e9}",
+        ] {
+            assert_eq!(local_path(Some(path)), "/", "{path:?}");
+        }
+        assert_eq!(local_path(None), "/");
+    }
+
+    #[test]
+    fn encode_query_round_trips() {
+        assert_eq!(encode_query("a b&c=d/é"), "a%20b%26c%3Dd%2F%C3%A9");
+        assert_eq!(encode_query("serde-json_1.0~x"), "serde-json_1.0~x");
+        // Every encoding is a valid local path to go back to
+        for q in ["", "a b", "\r\n", "//", "é"] {
+            let back = format!("/search?q={}", encode_query(q));
+            assert_eq!(local_path(Some(&back)), back);
+        }
+    }
+
+    #[test]
+    fn every_manifest_page_has_the_status_bar_and_links_back_to_itself() {
+        let (_tmp, state) = clean_fixture();
+
+        let list = index(&state).unwrap();
+        assert!(list.contains(r#"<div class="status">"#), "{list}");
+        assert!(list.contains("data from just now"), "{list}");
+        assert!(list.contains(" UTC and took "), "{list}");
+        assert!(list.contains(r#"<form class="refresh" action="/refresh" method="post">"#));
+        assert!(list.contains(r#"name="back" value="/""#), "{list}");
+        assert_eq!(list.matches("Refresh").count(), 1, "{list}");
+
+        let html = detail(&state, "a.txt", "sort=written").unwrap();
+        assert!(
+            html.contains(r#"value="/manifests/a.txt?sort=written""#),
+            "{html}"
+        );
+        let html = render(unmanifested_page(&state, params(""))).unwrap();
+        assert!(
+            html.contains(r#"value="/unmanifested?sort=name""#),
+            "{html}"
+        );
+        let html = search(&state, "a b").unwrap();
+        assert!(html.contains(r#"value="/search?q=a%20b""#), "{html}");
+    }
+
+    #[test]
+    fn header_links_to_the_list_views() {
+        let (_tmp, state) = clean_fixture();
+
+        for html in [
+            index(&state).unwrap(),
+            detail(&state, "a.txt", "").unwrap(),
+            search(&state, "").unwrap(),
+        ] {
+            assert!(html.contains(r#"<a href="/">manifests</a>"#), "{html}");
+            assert!(
+                html.contains(r#"<a href="/unmanifested">un-manifested</a>"#),
+                "{html}"
+            );
+        }
+        let html = detail(&state, "a.txt", "").unwrap();
+        assert!(html.contains(r#"<p class="crumbs">"#), "{html}");
+    }
+
+    #[test]
+    fn manifest_list_puts_unmanifested_first_then_the_newest() {
+        let (_tmp, state) = clean_fixture();
+        add_manifest(&state, "2026-01-01.txt", "serde@1.0.210\n");
+        add_manifest(&state, "2026-02-01.txt", "serde@1.0.210\n");
+
+        let list = index(&state).unwrap();
+
+        let at = |text: &str| list.find(text).unwrap_or_else(|| panic!("{text}: {list}"));
+        assert!(at("(un-manifested)") < at("2026-02-01.txt"));
+        assert!(at("2026-02-01.txt") < at("2026-01-01.txt"));
+    }
+
+    #[test]
+    fn scan_time_has_seconds_and_a_zone() {
+        let time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_760_000_000);
+        assert_eq!(format_time_with_seconds(time), "2025-10-09 08:53:20 UTC");
+    }
+
+    #[test]
+    fn manifest_list_shows_a_bad_file_and_the_good_ones() {
+        let (_tmp, state) = fixture();
+
+        let list = index(&state).unwrap();
+
+        assert!(
+            list.contains(r#"<a href="/manifests/a.txt">a.txt</a>"#),
+            "{list}"
+        );
+        assert!(list.contains(r#"<td class="count">3</td>"#), "{list}");
+        assert!(
+            list.contains(r#"<td class="error">did not parse</td>"#),
+            "{list}"
+        );
+        // `broken.txt` can record any crate, so the un-manifested ones are not known
+        assert!(
+            list.contains(r#"<td class="error">not known</td>"#),
+            "{list}"
+        );
+        assert!(list.contains("a manifest did not parse"), "{list}");
+    }
+
+    #[test]
+    fn manifest_list_counts_crates_and_unmanifested() {
+        let (_tmp, state) = clean_fixture();
+        add_manifest(&state, "a.txt", "serde@1.0.210\naxum@0.8.1\n");
+
+        let list = index(&state).unwrap();
+
+        assert!(
+            list.contains(r#"<a href="/manifests/a.txt">a.txt</a>"#),
+            "{list}"
+        );
+        assert!(list.contains(r#"<td class="count">2</td>"#), "{list}");
+        // `tokio` is in the mirror but in no manifest
+        assert!(list.contains(r#"<td class="count">1</td>"#), "{list}");
+        assert!(!list.contains("not known"), "{list}");
+    }
+
+    #[test]
+    fn manifest_list_with_an_unreadable_dir_says_so() {
+        let (_tmp, state) = fixture();
+        fs::remove_dir_all(manifests_dir(&state)).unwrap();
+        rescan(&state);
+
+        let (status, html) = error_body(manifests_index_page(&state));
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(html.contains("Manifests directory not readable"), "{html}");
+        assert_eq!(
+            search(&state, "serde"),
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         );
+    }
 
-        let no_dir = AppState {
-            mirror_path: state.mirror_path.clone(),
-            manifests_path: None,
+    #[test]
+    fn search_finds_crates_in_the_cached_manifests() {
+        let (_tmp, state) = clean_fixture();
+
+        let html = search(&state, "SER").unwrap();
+
+        assert!(html.contains("<td>serde</td>"), "{html}");
+        assert!(!html.contains("<td>tokio</td>"), "{html}");
+        assert!(!html.contains("did not parse"), "{html}");
+    }
+
+    #[test]
+    fn search_leaves_out_a_bad_file_and_says_so() {
+        let (_tmp, state) = fixture();
+
+        let html = search(&state, "serde").unwrap();
+
+        assert!(html.contains("<td>serde</td>"), "{html}");
+        assert!(
+            html.contains("1 manifest(s) did not parse, so the search leaves them out."),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn a_failed_mirror_scan_does_not_show_crates_as_culled() {
+        let (tmp, state) = clean_fixture();
+        let no_mirror =
+            AppState::new(tmp.path().join("nope"), Some(manifests_dir(&state))).unwrap();
+        rescan(&no_mirror);
+
+        let (status, html) = error_body(unmanifested_page(&no_mirror, params("")));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(html.contains("could not read the mirror"), "{html}");
+
+        let (status, html) = error_body(manifest_detail_page(&no_mirror, "a.txt", params("")));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(html.contains("Mirror scan failed"), "{html}");
+
+        let list = index(&no_mirror).unwrap();
+        assert!(
+            list.contains(r#"<td class="error">not known</td>"#),
+            "{list}"
+        );
+        assert!(list.contains("could not read the mirror"), "{list}");
+    }
+
+    #[test]
+    fn find_unmanifested_is_known_only_after_a_full_read() {
+        let mirror = || {
+            Mirror::Read(WriteTimes::from([(
+                Crate::new("serde".to_string(), "1.0.210".to_string()),
+                SystemTime::UNIX_EPOCH,
+            )]))
         };
-        let html = detail(&no_dir, "a.txt", "").unwrap();
-        assert!(html.contains("No manifests directory"));
+        let file = |crates| ParsedFile {
+            name: "a.txt".to_string(),
+            crates,
+        };
+
+        assert_eq!(
+            find_unmanifested(&Mirror::Failed, &Manifests::Files(vec![])),
+            Err(UnmanifestedUnknown::MirrorScanFailed)
+        );
+        assert_eq!(
+            find_unmanifested(&mirror(), &Manifests::Unreadable),
+            Err(UnmanifestedUnknown::ManifestsUnreadable)
+        );
+        assert_eq!(
+            find_unmanifested(
+                &mirror(),
+                &Manifests::Files(vec![file(Err(anyhow::anyhow!("bad")))])
+            ),
+            Err(UnmanifestedUnknown::ManifestParseFailed)
+        );
+        assert_eq!(
+            find_unmanifested(&mirror(), &Manifests::Files(vec![file(Ok(vec![]))])).unwrap(),
+            [Crate::new("serde".to_string(), "1.0.210".to_string())]
+        );
     }
 
     #[test]
     fn detail_pages_a_large_manifest() {
         let (_tmp, state) = fixture();
-        let dir = state.manifests_path.as_deref().unwrap();
         let lines: String = (0..PAGE_SIZE + 5)
             .map(|n| format!("gone{n:05}@1.0.0\n"))
             .collect();
-        fs::write(dir.join("big.txt"), lines).unwrap();
+        add_manifest(&state, "big.txt", &lines);
 
         let first = detail(&state, "big.txt", "show=culled").unwrap();
         assert!(first.contains("page 1 of 2"));
@@ -1122,14 +2280,10 @@ mod tests {
 
     #[test]
     fn unmanifested_ignores_show_culled() {
-        let (_tmp, state) = fixture();
-        let dir = state.manifests_path.as_deref().unwrap();
-        fs::remove_file(dir.join("broken.txt")).unwrap();
-        fs::write(dir.join("a.txt"), "serde@1.0.210\n").unwrap();
+        let (_tmp, state) = clean_fixture();
+        add_manifest(&state, "a.txt", "serde@1.0.210\n");
 
-        let html = unmanifested_page(&state, params("show=culled"))
-            .unwrap()
-            .into_string();
+        let html = render(unmanifested_page(&state, params("show=culled"))).unwrap();
 
         assert!(html.contains("1 crate(s) in the mirror"));
         assert!(html.contains("<td>tokio</td>"));

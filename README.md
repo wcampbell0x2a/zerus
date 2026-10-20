@@ -64,8 +64,6 @@ On the offline network, use `update-index` to generate a registry index from the
 ```console
 $ zerus update-index new-mirror --dl-url http://[IP]
 ```
-$ zerus update-index new-mirror --dl-url http://[IP]
-```
 
 The URL is a base path — zerus appends `/crates/{prefix}/{crate}/{version}/{crate}-{version}.crate` to it. Pass the server address, not the full download template.
 
@@ -100,6 +98,12 @@ browse them in the web UI at the root path.
 ```console
 $ zerus serve new-mirror --manifests manifests/
 ```
+
+The server scans the mirror and the manifests in the background when it starts, and keeps
+the result in memory, so the pages stay fast when the mirror is on a slow or network disk.
+Cargo can use the registry while the first scan runs. The header of each page shows how old
+its data is. To see new transfers and culls, click Refresh in the header. The scan runs in the
+background, and the page reloads until the scan is done. Only one scan runs at a time.
 
 ### Build with mirror
 Add the following to `.cargo/config.toml` (replacing `[IP]` with your server address).

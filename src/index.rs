@@ -115,14 +115,24 @@ pub fn find_crate_files(crates_path: &Path) -> Vec<PathBuf> {
 // Recurse into subdirs in parallel via rayon. `on_found` fires per .crate hit;
 // pass `&|| {}` to skip it.
 fn find_crate_files_recursive(dir: &Path, on_found: &(impl Fn() + Sync)) -> Vec<PathBuf> {
-    let entries: Vec<PathBuf> = match fs::read_dir(dir) {
-        Ok(e) => e.flatten().map(|entry| entry.path()).collect(),
+    let entries: Vec<(PathBuf, Option<fs::FileType>)> = match fs::read_dir(dir) {
+        Ok(e) => e
+            .flatten()
+            .map(|entry| (entry.path(), entry.file_type().ok()))
+            .collect(),
         Err(_) => return Vec::new(),
     };
     entries
         .par_iter()
-        .flat_map(|path| {
-            if path.is_dir() {
+        .flat_map(|(path, file_type)| {
+            // The directory listing gives the type, so most entries need no stat. That is a
+            // network round trip saved per entry on a network mount. A symlink still needs a
+            // stat to find out what it points to.
+            let is_dir = match file_type {
+                Some(t) if !t.is_symlink() => t.is_dir(),
+                _ => path.is_dir(),
+            };
+            if is_dir {
                 find_crate_files_recursive(path, on_found)
             } else if path.extension().is_some_and(|e| e == "crate") {
                 on_found();
