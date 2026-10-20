@@ -742,6 +742,42 @@ impl FromStr for Sort {
     }
 }
 
+/// The direction of a sort, relative to the usual order of its column: A to Z for names, and
+/// newest first for write times
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Direction {
+    Usual,
+    Reversed,
+}
+
+impl Direction {
+    /// The `dir=` value that asks for this direction
+    fn param(self) -> &'static str {
+        match self {
+            Self::Usual => "usual",
+            Self::Reversed => "reversed",
+        }
+    }
+
+    fn flipped(self) -> Self {
+        match self {
+            Self::Usual => Self::Reversed,
+            Self::Reversed => Self::Usual,
+        }
+    }
+}
+
+impl FromStr for Direction {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        [Self::Usual, Self::Reversed]
+            .into_iter()
+            .find(|dir| dir.param() == value)
+            .ok_or(())
+    }
+}
+
 /// The part of a manifest's crates that a detail page lists
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Show {
@@ -789,12 +825,13 @@ impl Listed<'_> {
     }
 }
 
-/// Pair each crate with its write time and order the result by `sort`.
+/// Pair each crate with its write time and order the result by `sort` in direction `dir`.
 /// Newest first when sorting by write time; culled crates have no time, so they sort last.
 fn listing<'a>(
     crates: impl IntoIterator<Item = &'a Crate>,
     mirror: &WriteTimes,
     sort: Sort,
+    dir: Direction,
 ) -> Vec<Listed<'a>> {
     let mut listed: Vec<Listed<'a>> = crates
         .into_iter()
@@ -804,11 +841,13 @@ fn listing<'a>(
         })
         .collect();
 
-    match sort {
-        Sort::Name => listed.par_sort_by(|a, b| a.krate.cmp(b.krate)),
-        Sort::Written => {
-            listed.par_sort_by(|a, b| b.written.cmp(&a.written).then_with(|| a.krate.cmp(b.krate)))
-        }
+    let usual = |a: &Listed<'_>, b: &Listed<'_>| match sort {
+        Sort::Name => a.krate.cmp(b.krate),
+        Sort::Written => b.written.cmp(&a.written).then_with(|| a.krate.cmp(b.krate)),
+    };
+    match dir {
+        Direction::Usual => listed.par_sort_by(usual),
+        Direction::Reversed => listed.par_sort_by(|a, b| usual(b, a)),
     }
 
     listed
@@ -853,6 +892,8 @@ struct ListParams {
     #[serde(default, deserialize_with = "ignore_invalid")]
     sort: Option<Sort>,
     #[serde(default, deserialize_with = "ignore_invalid")]
+    dir: Option<Direction>,
+    #[serde(default, deserialize_with = "ignore_invalid")]
     show: Option<Show>,
     #[serde(default, deserialize_with = "ignore_invalid")]
     page: Option<usize>,
@@ -873,6 +914,7 @@ impl ListParams {
         View {
             base,
             sort: self.sort.unwrap_or(Sort::Name),
+            dir: self.dir.unwrap_or(Direction::Usual),
             show: self.show.unwrap_or(Show::Present),
             page: self.page.unwrap_or(1),
         }
@@ -886,16 +928,26 @@ struct View<'a> {
     /// The path of the listing, e.g. `/manifests/2026-08-13.txt`
     base: &'a str,
     sort: Sort,
+    dir: Direction,
     show: Show,
     /// 1-based
     page: usize,
 }
 
 impl View<'_> {
-    /// A new order starts back at page 1, as the old page number points at other rows
-    fn with_sort(self, sort: Sort) -> Self {
+    /// The view after a click on the header of `column`. A click on the column that the
+    /// listing is sorted by reverses the order; a click on another column sorts by it in its
+    /// usual order. A new order starts back at page 1, as the old page number points at
+    /// other rows.
+    fn sorted_by(self, column: Sort) -> Self {
+        let dir = if column == self.sort {
+            self.dir.flipped()
+        } else {
+            Direction::Usual
+        };
         Self {
-            sort,
+            sort: column,
+            dir,
             page: 1,
             ..self
         }
@@ -916,6 +968,10 @@ impl View<'_> {
     /// The URL of this view. Defaults stay out of it, other than `sort`, to keep URLs short.
     fn href(&self) -> String {
         let mut href = format!("{}?sort={}", self.base, self.sort.param());
+        if self.dir != Direction::Usual {
+            href.push_str("&dir=");
+            href.push_str(self.dir.param());
+        }
         if self.show != Show::Present {
             href.push_str("&show=");
             href.push_str(self.show.param());
@@ -986,10 +1042,18 @@ fn pager<T>(page: &Page<'_, T>, view: View<'_>) -> Markup {
     }
 }
 
-/// Column header that re-requests the page sorted by `column`
+/// Column header that re-requests the page sorted by `column`, or in the reverse order if the
+/// page is already sorted by `column`
 fn sort_link(view: View<'_>, label: &str, column: Sort) -> Markup {
+    let active = column == view.sort;
+    let title = if active {
+        "reverse the order"
+    } else {
+        "sort by this column"
+    };
     html! {
-        a.sort.active[column == view.sort] href=(view.with_sort(column).href()) { (label) }
+        a.sort.active[active].reversed[active && view.dir == Direction::Reversed]
+            href=(view.sorted_by(column).href()) title=(title) { (label) }
     }
 }
 
@@ -1044,6 +1108,7 @@ fn page_with_search(
                     }
                 }
                 main { (body) }
+                (footer())
                 script { (PreEscaped(SEARCH_SHORTCUT_JS)) }
                 @if reload == Reload::WhenScanDone {
                     script { (PreEscaped(SCAN_WAIT_JS)) }
@@ -1053,19 +1118,49 @@ fn page_with_search(
     }
 }
 
+/// A link to the source. The URL comes from `repository` in Cargo.toml, so it stays in one
+/// place.
+fn footer() -> Markup {
+    let repository = env!("CARGO_PKG_REPOSITORY");
+    html! {
+        footer {
+            a.repo href=(repository) {
+                // Inline, as the mirror serves offline networks where an image download fails
+                (PreEscaped(GITHUB_MARK_SVG))
+                (repository.trim_start_matches("https://github.com/"))
+            }
+        }
+    }
+}
+
+/// The GitHub mark from Octicons (MIT license), drawn in the text color
+const GITHUB_MARK_SVG: &str = r#"<svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true" fill="currentColor"><path d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z"/></svg>"#;
+
 const PAGE_CSS: &str = "\
-:root { color-scheme: light dark; }
+:root { color-scheme: light dark;
+        --line: color-mix(in srgb, CanvasText 15%, transparent); }
 /* Only fonts already on the machine. The mirror serves offline networks, so a webfont
    download would fail and drop the page back to the browser default. */
 body { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Cascadia Mono',
        'DejaVu Sans Mono', 'Liberation Mono', monospace; margin: 0 auto;
-       max-width: 60rem; padding: 1.5rem; line-height: 1.5; }
+       max-width: 60rem; padding: 1.5rem; line-height: 1.5;
+       /* Keep the footer at the bottom of a short page */
+       box-sizing: border-box; min-height: 100vh; display: flex; flex-direction: column; }
+main { flex: 1; }
+button, input { font: inherit; }
 header { border-bottom: 1px solid currentColor; margin-bottom: 1.5rem; padding-bottom: .5rem;
          display: flex; flex-wrap: wrap; align-items: baseline; gap: .5rem 1rem; }
 nav.site a { margin-right: 1rem; color: inherit; }
 nav.site a.home { font-weight: bold; text-decoration: none; margin-right: .5rem; }
 header .version { margin-right: 1.5rem; font-size: .85em;
                   color: color-mix(in srgb, currentColor 65%, transparent); }
+footer { border-top: 1px solid var(--line);
+         margin-top: 3rem; padding-top: 1rem; font-size: .85em;
+         display: flex; justify-content: flex-end;
+         color: color-mix(in srgb, currentColor 65%, transparent); }
+footer a.repo { color: inherit; text-decoration: none;
+                display: inline-flex; align-items: center; gap: .4rem; }
+footer a.repo:hover { color: CanvasText; text-decoration: underline; }
 .status { flex-basis: 100%; text-align: right; font-size: .85em;
           color: color-mix(in srgb, currentColor 65%, transparent); }
 button.link { font: inherit; color: inherit; background: none; border: 0; padding: 0;
@@ -1073,7 +1168,8 @@ button.link { font: inherit; color: inherit; background: none; border: 0; paddin
 table { border-collapse: collapse; width: 100%; }
 td, th { text-align: left; padding: .25rem .75rem .25rem 0; }
 th { border-bottom: 1px solid currentColor; }
-tr + tr td { border-top: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
+/* A fixed color, as `currentColor` would tint the line of an error cell */
+tr + tr td { border-top: 1px solid var(--line); }
 .culled { opacity: .55; }
 .count { color: color-mix(in srgb, currentColor 65%, transparent); }
 td.num { font-variant-numeric: tabular-nums; }
@@ -1085,6 +1181,7 @@ nav.pages a, nav.pages span { margin-right: .75rem; }
 a.sort { color: inherit; text-decoration: none; }
 a.sort:hover { text-decoration: underline; }
 a.sort.active::after { content: ' \\2193'; }
+a.sort.active.reversed::after { content: ' \\2191'; }
 form.search, form.refresh { display: inline; }
 form.search { margin-left: auto; }
 .error { color: #c62828; }
@@ -1397,7 +1494,7 @@ fn manifest_detail_page(
         return Err(mirror_scan_failed(&bar));
     };
 
-    let listed = listing(crates, mirror, view.sort);
+    let listed = listing(crates, mirror, view.sort, view.dir);
     let (present, culled) = split_culled(&listed);
 
     Ok(page(
@@ -1475,7 +1572,7 @@ fn unmanifested_page(state: &AppState, params: ListParams) -> Result<Markup, Err
         return Err(mirror_scan_failed(&bar));
     };
 
-    let listed = listing(crates, mirror, view.sort);
+    let listed = listing(crates, mirror, view.sort, view.dir);
     let all: Vec<&Listed<'_>> = listed.iter().collect();
 
     Ok(page(
@@ -1645,8 +1742,9 @@ mod tests {
 
     #[test]
     fn list_params_parse_known_values() {
-        let p = params("sort=written&show=culled&page=3");
+        let p = params("sort=written&dir=reversed&show=culled&page=3");
         assert_eq!(p.sort, Some(Sort::Written));
+        assert_eq!(p.dir, Some(Direction::Reversed));
         assert_eq!(p.show, Some(Show::Culled));
         assert_eq!(p.page, Some(3));
     }
@@ -1655,13 +1753,14 @@ mod tests {
     fn list_params_ignore_bad_and_missing_values() {
         for query in [
             "",
-            "sort=zzz&show=all&page=abc",
+            "sort=zzz&dir=up&show=all&page=abc",
             "page=-1",
             "page=",
             "sort=Name",
         ] {
             let p = params(query);
             assert_eq!(p.sort, None, "{query}");
+            assert_eq!(p.dir, None, "{query}");
             assert_eq!(p.show, None, "{query}");
             assert_eq!(p.page, None, "{query}");
         }
@@ -1671,6 +1770,7 @@ mod tests {
     fn view_defaults() {
         let view = ListParams::default().view("/b");
         assert_eq!(view.sort, Sort::Name);
+        assert_eq!(view.dir, Direction::Usual);
         assert_eq!(view.show, Show::Present);
         assert_eq!(view.page, 1);
         assert_eq!(view.href(), "/b?sort=name");
@@ -1678,26 +1778,29 @@ mod tests {
 
     #[test]
     fn view_href_keeps_every_non_default_field() {
-        let view = params("sort=written&show=culled&page=4").view("/manifests/a.txt");
+        let view = params("sort=written&dir=reversed&show=culled&page=4").view("/manifests/a.txt");
         assert_eq!(
             view.href(),
-            "/manifests/a.txt?sort=written&show=culled&page=4"
+            "/manifests/a.txt?sort=written&dir=reversed&show=culled&page=4"
         );
     }
 
     #[test]
     fn view_href_round_trips_through_list_params() {
         for sort in [Sort::Name, Sort::Written] {
-            for show in [Show::Present, Show::Culled] {
-                for page in [1, 2, 99] {
-                    let view = View {
-                        base: "/b",
-                        sort,
-                        show,
-                        page,
-                    };
-                    let query = view.href().split_once('?').unwrap().1.to_string();
-                    assert_eq!(params(&query).view("/b"), view);
+            for dir in [Direction::Usual, Direction::Reversed] {
+                for show in [Show::Present, Show::Culled] {
+                    for page in [1, 2, 99] {
+                        let view = View {
+                            base: "/b",
+                            sort,
+                            dir,
+                            show,
+                            page,
+                        };
+                        let query = view.href().split_once('?').unwrap().1.to_string();
+                        assert_eq!(params(&query).view("/b"), view);
+                    }
                 }
             }
         }
@@ -1705,12 +1808,12 @@ mod tests {
 
     #[test]
     fn new_sort_or_show_starts_at_page_one_and_keeps_the_rest() {
-        let view = params("sort=written&show=culled&page=4").view("/b");
+        let view = params("sort=written&dir=reversed&show=culled&page=4").view("/b");
 
-        let sorted = view.with_sort(Sort::Name);
+        let sorted = view.sorted_by(Sort::Name);
         assert_eq!(
-            (sorted.sort, sorted.show, sorted.page),
-            (Sort::Name, Show::Culled, 1)
+            (sorted.sort, sorted.dir, sorted.show, sorted.page),
+            (Sort::Name, Direction::Usual, Show::Culled, 1)
         );
 
         let shown = view.with_show(Show::Present);
@@ -1718,6 +1821,69 @@ mod tests {
             (shown.sort, shown.show, shown.page),
             (Sort::Written, Show::Present, 1)
         );
+    }
+
+    #[test]
+    fn a_click_on_the_sorted_column_reverses_the_order() {
+        let view = params("sort=name&page=3").view("/b");
+
+        let reversed = view.sorted_by(Sort::Name);
+        assert_eq!(
+            (reversed.sort, reversed.dir, reversed.page),
+            (Sort::Name, Direction::Reversed, 1)
+        );
+        let back = reversed.sorted_by(Sort::Name);
+        assert_eq!((back.sort, back.dir), (Sort::Name, Direction::Usual));
+        // Another column starts in its usual order
+        let written = reversed.sorted_by(Sort::Written);
+        assert_eq!(
+            (written.sort, written.dir),
+            (Sort::Written, Direction::Usual)
+        );
+    }
+
+    #[test]
+    fn listing_reverses_each_column() {
+        let old = SystemTime::UNIX_EPOCH;
+        let new = old + Duration::from_secs(60);
+        let krate = |name: &str| Crate::new(name.to_string(), "1.0.0".to_string());
+        let crates = [krate("a"), krate("b"), krate("c")];
+        let mirror = WriteTimes::from([(krate("a"), new), (krate("b"), old)]);
+        let names = |sort, dir| -> Vec<String> {
+            listing(&crates, &mirror, sort, dir)
+                .iter()
+                .map(|l| l.krate.name.clone())
+                .collect()
+        };
+
+        assert_eq!(names(Sort::Name, Direction::Usual), ["a", "b", "c"]);
+        assert_eq!(names(Sort::Name, Direction::Reversed), ["c", "b", "a"]);
+        // Newest first, and `c` has no file, so it is last
+        assert_eq!(names(Sort::Written, Direction::Usual), ["a", "b", "c"]);
+        assert_eq!(names(Sort::Written, Direction::Reversed), ["c", "b", "a"]);
+    }
+
+    #[test]
+    fn the_sorted_header_links_to_the_reverse_order() {
+        let (_tmp, state) = clean_fixture();
+
+        let html = detail(&state, "a.txt", "").unwrap();
+        assert!(
+            html.contains(r#"<a class="sort active" href="/manifests/a.txt?sort=name&amp;dir=reversed" title="reverse the order">crate</a>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<a class="sort" href="/manifests/a.txt?sort=written" title="sort by this column">"#),
+            "{html}"
+        );
+        assert!(html.find("<td>serde</td>") < html.find("<td>tokio</td>"));
+
+        let html = detail(&state, "a.txt", "sort=name&dir=reversed").unwrap();
+        assert!(
+            html.contains(r#"<a class="sort active reversed" href="/manifests/a.txt?sort=name" "#),
+            "{html}"
+        );
+        assert!(html.find("<td>tokio</td>") < html.find("<td>serde</td>"));
     }
 
     #[test]
@@ -2511,6 +2677,26 @@ serde@1.0.210
         );
         let html = search(&state, "a b").unwrap();
         assert!(html.contains(r#"value="/search?q=a%20b""#), "{html}");
+    }
+
+    #[test]
+    fn every_page_has_a_footer_with_the_repository_link() {
+        let (_tmp, state) = clean_fixture();
+        let link = r#"<a class="repo" href="https://github.com/wcampbell0x2a/zerus"><svg "#;
+
+        for html in [
+            index(&state).unwrap(),
+            detail(&state, "a.txt", "").unwrap(),
+            search(&state, "").unwrap(),
+            error_body(manifest_detail_page(&state, "nope.txt", params(""))).1,
+        ] {
+            let footer = html
+                .split("<footer>")
+                .nth(1)
+                .unwrap_or_else(|| panic!("{html}"));
+            assert!(footer.contains(link), "{footer}");
+            assert!(footer.contains("wcampbell0x2a/zerus</a>"), "{footer}");
+        }
     }
 
     #[test]
