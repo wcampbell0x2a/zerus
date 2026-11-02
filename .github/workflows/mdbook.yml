@@ -24,7 +24,7 @@ jobs:
         with:
           toolchain: stable
           target: x86_64-unknown-linux-musl
-      - uses: extractions/setup-just@v3
+      - uses: extractions/setup-just@v4
       # .cargo/config.toml sets the musl target, and ring needs musl-gcc to build
       - name: Install musl-gcc
         run: sudo apt-get update && sudo apt-get install --yes musl-tools
